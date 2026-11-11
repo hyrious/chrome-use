@@ -138,6 +138,10 @@ await run(session, {
 chrome-use stop; chrome-use start -x http://localhost:7890
 ```
 
+## Credits
+
+- Inspired by [browser-use/jev-ultrafast](https://github.com/browser-use/jev-ultrafast) for the fast indexed action space and Jev decision loop.
+
 ## License
 
 MIT @ [hyrious](https://github.com/hyrious)
