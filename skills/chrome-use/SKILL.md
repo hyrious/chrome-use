@@ -7,6 +7,22 @@ description: Drive the user's own logged-in Chrome, headed, on a persistent prof
 
 One dedicated Chrome profile, started once, driven over CDP. The profile persists, so a login the user does by hand keeps working in later runs.
 
+## Finish the job, then report
+
+What the user wants is a finished flow, not a conversation. Fill what the task needs with the most defensible value you can find, keep going while the next step is still knowable, and put the caveats in the closing message.
+
+Stop and hand back only when:
+
+- The next step is destructive or public: submit, publish, pay, delete, send a message, place an order. Do this only when the user asked for it in so many words.
+- A human wall is in the way: sign-in, captcha, 2FA, a payment or identity check, a permission the profile does not have.
+- The value you would have to invent decides the outcome and no default is defensible.
+
+Everything else is a place to make a call and say so afterwards. A color picked from three near-synonyms, a placeholder price, a size chart filled with plausible numbers, an optional upload slot left empty: choose, continue, mention it at the end. A draft in a form is reversible; the closing report is where the ambiguity belongs.
+
+Two failures on the same control with the same error mean the approach is wrong, not the timing. Three wrong approaches mean stop, report the blocker, and say what you tried. Do not burn ten rounds guessing at one widget.
+
+The closing message is part of the task: what you filled, which values you invented, what you left blank and why, and the one action still waiting for the user.
+
 ## Check first
 
 ```bash
@@ -40,6 +56,14 @@ chrome-use upload e12-9fk ./receipt.png
 ```
 
 `snap` prints `ref role "label" operations`. A ref looks like `e12-9fk`: the element number plus a token for the current document. Treat it as opaque, copy it exactly, and act only on refs from the latest snapshot. Never invent a selector and never click by coordinates. `click`, `type`, `select`, `upload`, `open`, and `press` all return the new snapshot.
+
+When the table leaves the node out, pass a CSS selector instead of a ref. That covers what the table cannot see: the file input behind a styled upload box, a `div` that only carries a click handler, a control on a form too long to snapshot in one view.
+
+```bash
+chrome-use upload 'input[type=file]' ./receipt.png
+chrome-use click 'button.add'
+chrome-use press Control+a             # also Meta+z, Shift+Tab, Escape
+```
 
 **One script.** When the flow needs logic, a loop, several coordinated steps, or a comparison across the page, write it once with `chrome-use js`:
 
@@ -94,8 +118,8 @@ It returns `verified: false` always, so verify the result yourself (URL, page te
 - A click scrolls the element into view and hit tests it. If it throws `NOT_INTERACTABLE`, something really covers it: close the overlay or scroll, then retry.
 - `STALE` means the element is gone. Take a new snapshot and find the element again by label, not by remembering the ref.
 - Refs carry a document token, so one from before a navigation is rejected with `STALE` instead of silently hitting a different element. Take a new `snap`.
-- Login, captcha, 2FA, payment, anything destructive: stop and ask the user. Do not try to automate them.
-- Uploading a file publishes it to the site. Only use a path the user named, and never attach something you found by guessing.
+- Human walls belong to the user: login, captcha, 2FA, payment, an identity check. Stop there. Anything short of a wall — an awkward widget, a missing label, an overlay in the way — belongs to you; a selector or a script can usually reach it.
+- Uploading a file publishes it to the site. Only use a path the user named, or one unpacked from a path the user named, and never attach something you found by guessing.
 - Native `alert` dialogs are dismissed automatically and counted in `snap.dialogs`.
 - Elements inside open shadow roots and same-origin iframes appear in the table and can be clicked. Cross-origin frames cannot; ask the user when a payment or captcha widget lives there.
 - The element table only covers what the viewport shows. If the control you need is not listed, `SCROLL_DOWN` before concluding anything.

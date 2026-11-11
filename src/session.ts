@@ -1,11 +1,19 @@
 import type { TargetInfo } from './cdp.ts'
+import type { Target } from './page.ts'
 import type { Snapshot, SnapshotAction } from './snapshot.ts'
 
 import { writeFile } from 'node:fs/promises'
 
 import { browserInfo, CDP, listTargets } from './cdp.ts'
 import { ChromeUseError, fail } from './errors.ts'
-import { nodeExpression, resolveExpression, selectExpression, settleExpression, snapshotExpression } from './page.ts'
+import {
+  nodeExpression,
+  parseTarget,
+  resolveExpression,
+  selectExpression,
+  settleExpression,
+  snapshotExpression,
+} from './page.ts'
 import { readState, writeState } from './state.ts'
 import { delay } from './time.ts'
 
@@ -72,6 +80,44 @@ const KEYS: Record<string, KeySpec> = {
   PageUp: { code: 'PageUp', keyCode: 33 },
   PageDown: { code: 'PageDown', keyCode: 34 },
   ' ': { code: 'Space', keyCode: 32, text: ' ' },
+}
+
+/** Bit flags the Input domain expects in `modifiers`. */
+const MODIFIERS: Record<string, number> = {
+  alt: 1,
+  option: 1,
+  control: 2,
+  ctrl: 2,
+  meta: 4,
+  command: 4,
+  cmd: 4,
+  super: 4,
+  shift: 8,
+}
+
+const ALIASES: Record<string, string> = { esc: 'Escape', return: 'Enter', space: ' ', del: 'Delete' }
+
+/** Editor commands a synthetic chord has to name explicitly; key events alone do not run them. */
+const COMMANDS: Record<string, string> = { a: 'selectAll', c: 'copy', v: 'paste', x: 'cut', z: 'undo', y: 'redo' }
+
+interface Chord {
+  name: string
+  modifiers: number
+}
+
+/** Reads `Control+a`, `Meta+Shift+z`, or a bare `Enter` into a key plus its modifier bits. */
+function parseChord(key: string): Chord {
+  const parts = key.split('+')
+  const raw = parts.pop() ?? ''
+  const name = ALIASES[raw.toLowerCase()] ?? raw
+  if (!name) fail('NOT_INTERACTABLE', 'press needs a key')
+  let modifiers = 0
+  for (const part of parts) {
+    const bit = MODIFIERS[part.toLowerCase()]
+    if (bit == null) fail('NOT_INTERACTABLE', `Unknown modifier ${part} in ${key}`)
+    modifiers |= bit
+  }
+  return { name, modifiers }
 }
 
 async function createPage(cdp: CDP): Promise<TargetInfo> {
@@ -214,70 +260,63 @@ export class Session {
     }
   }
 
-  async click(ref: string): Promise<Snapshot> {
-    await this.mouse(await this.point(ref))
-    await this.settle(ref)
+  async click(target: string): Promise<Snapshot> {
+    const wanted = parseTarget(target)
+    await this.mouse(await this.point(wanted))
+    await this.settle(wanted)
     return this.snap()
   }
 
-  async type(ref: string, text: string): Promise<Snapshot> {
-    await this.mouse(await this.point(ref))
-    const modifier = process.platform === 'darwin' ? 4 : 2
-    await this.cdp.send(
-      'Input.dispatchKeyEvent',
-      { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: modifier, commands: ['selectAll'] },
-      this.sessionId,
-    )
-    await this.cdp.send(
-      'Input.dispatchKeyEvent',
-      { type: 'keyUp', key: 'a', code: 'KeyA', modifiers: modifier },
-      this.sessionId,
-    )
+  async type(target: string, text: string): Promise<Snapshot> {
+    const wanted = parseTarget(target)
+    await this.mouse(await this.point(wanted))
+    // Select what is already there first, so typing replaces instead of appending.
+    const selectAll = process.platform === 'darwin' ? 'Meta+a' : 'Control+a'
+    await this.dispatchChord(parseChord(selectAll))
     await this.cdp.send('Input.insertText', { text }, this.sessionId)
-    await this.settle(ref)
+    await this.settle(wanted)
     return this.snap()
   }
 
-  async select(ref: string, value: string): Promise<Snapshot> {
-    const result = await this.eval<{ reason?: string }>(selectExpression(ref, value))
-    if (result.reason === 'gone') fail('STALE', `Element ${ref} is gone; take a new snapshot`)
-    if (result.reason === 'not-select') fail('NOT_INTERACTABLE', `Element ${ref} is not a native select`)
+  async select(target: string, value: string): Promise<Snapshot> {
+    const wanted = parseTarget(target)
+    const result = await this.eval<{ reason?: string }>(selectExpression(wanted, value))
+    if (result.reason === 'gone') fail('STALE', `Element ${target} is gone; take a new snapshot`)
+    if (result.reason === 'bad-selector') fail('NOT_INTERACTABLE', `${target} is not a valid CSS selector`)
+    if (result.reason === 'not-select') fail('NOT_INTERACTABLE', `Element ${target} is not a native select`)
     if (result.reason === 'no-option')
-      fail('NOT_INTERACTABLE', `Element ${ref} has no option with value ${JSON.stringify(value)}`)
-    await this.settle(ref)
+      fail('NOT_INTERACTABLE', `Element ${target} has no option with value ${JSON.stringify(value)}`)
+    await this.settle(wanted)
     return this.snap()
   }
 
   async press(key: string): Promise<Snapshot> {
-    const spec = KEYS[key]
-    if (spec) await this.dispatchKey(key, spec)
-    else if (key.length > 1) fail('NOT_INTERACTABLE', `Unknown key ${key}`)
-    else {
-      await this.cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key, text: key }, this.sessionId)
-      await this.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key }, this.sessionId)
-    }
+    const chord = parseChord(key)
+    await this.dispatchChord(chord)
     // Enter and Space often submit, and the page can start moving a moment later.
-    if (key === 'Enter' || key === ' ') {
+    if (chord.name === 'Enter' || chord.name === ' ') {
       await this.waitForNavigation()
       await this.waitForReady(10)
     }
     return this.snap()
   }
 
-  async upload(ref: string, files: string[]): Promise<Snapshot> {
+  /** A ref from snap, or a CSS selector when the snapshot never listed the node. */
+  async upload(target: string, files: string[]): Promise<Snapshot> {
+    const wanted = parseTarget(target)
     const evaluated = await this.cdp.send<{ result: { objectId?: string }; exceptionDetails?: unknown }>(
       'Runtime.evaluate',
-      { expression: nodeExpression(ref), objectGroup: 'chrome-use' },
+      { expression: nodeExpression(wanted), objectGroup: 'chrome-use' },
       this.sessionId,
     )
     const objectId = evaluated.result?.objectId
-    if (!objectId) fail('STALE', `Element ${ref} is not on the page any more; take a new snapshot`)
+    if (!objectId) fail('STALE', `Element ${target} is not on the page any more; take a new snapshot`)
     try {
       await this.cdp.send('DOM.setFileInputFiles', { files, objectId }, this.sessionId)
     } finally {
       await this.cdp.send('Runtime.releaseObjectGroup', { objectGroup: 'chrome-use' }, this.sessionId).catch(() => {})
     }
-    await this.settle(ref)
+    await this.settle(wanted)
     return this.snap()
   }
 
@@ -388,19 +427,33 @@ export class Session {
     return { format: 'png', captureBeyondViewport: true, clip: { x: 0, y: 0, width, height, scale: 1 } }
   }
 
-  private async dispatchKey(key: string, spec: KeySpec): Promise<void> {
-    const base = { key, code: spec.code, windowsVirtualKeyCode: spec.keyCode, nativeVirtualKeyCode: spec.keyCode }
-    // Enter and Space only run their default action, such as submitting a form or
-    // activating a button, when the key down carries text. Other keys work raw.
-    if (spec.text) {
-      await this.cdp.send(
-        'Input.dispatchKeyEvent',
-        { type: 'keyDown', ...base, text: spec.text, unmodifiedText: spec.text },
-        this.sessionId,
-      )
+  private async dispatchChord(chord: Chord): Promise<void> {
+    const spec = KEYS[chord.name]
+    const base: Record<string, unknown> = { key: chord.name, modifiers: chord.modifiers }
+    if (spec) {
+      base.code = spec.code
+      base.windowsVirtualKeyCode = spec.keyCode
+      base.nativeVirtualKeyCode = spec.keyCode
+      // Enter and Space only run their default action, such as submitting a form or
+      // activating a button, when the key down carries text. Other keys work raw.
+      if (spec.text && !chord.modifiers) {
+        base.text = spec.text
+        base.unmodifiedText = spec.text
+      }
+    } else if (chord.name.length === 1) {
+      if (/[a-z]/i.test(chord.name)) base.code = `Key${chord.name.toUpperCase()}`
+      else if (/[0-9]/.test(chord.name)) base.code = `Digit${chord.name}`
+      if (!chord.modifiers) base.text = chord.name
     } else {
-      await this.cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...base }, this.sessionId)
+      fail('NOT_INTERACTABLE', `Unknown key ${chord.name}`)
     }
+    const command = chord.modifiers ? COMMANDS[chord.name.toLowerCase()] : undefined
+    if (command) base.commands = [command]
+    await this.cdp.send(
+      'Input.dispatchKeyEvent',
+      { type: base.text ? 'keyDown' : 'rawKeyDown', ...base },
+      this.sessionId,
+    )
     await this.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base }, this.sessionId)
   }
 
@@ -409,16 +462,18 @@ export class Session {
     if (state) writeState({ ...state, tab: this.targetId })
   }
 
-  private async point(ref: string): Promise<Point> {
-    const hit = await this.eval<TargetHit>(resolveExpression(ref))
+  private async point(target: Target): Promise<Point> {
+    const hit = await this.eval<TargetHit>(resolveExpression(target))
+    const name = 'ref' in target ? target.ref : target.selector
     if (hit.reason === 'gone' || hit.reason === 'hidden') {
-      fail('STALE', `Element ${ref} is not on the page any more; take a new snapshot`)
+      fail('STALE', `Element ${name} is not on the page any more; take a new snapshot`)
     }
+    if (hit.reason === 'bad-selector') fail('NOT_INTERACTABLE', `${name} is not a valid CSS selector`)
     if (hit.reason) {
-      fail('NOT_INTERACTABLE', `Element ${ref} cannot be clicked (${hit.reason}); take a new snapshot`)
+      fail('NOT_INTERACTABLE', `Element ${name} cannot be clicked (${hit.reason}); take a new snapshot`)
     }
     const { x, y } = hit
-    if (x == null || y == null) fail('NOT_INTERACTABLE', `Element ${ref} has no position; take a new snapshot`)
+    if (x == null || y == null) fail('NOT_INTERACTABLE', `Element ${name} has no position; take a new snapshot`)
     return { x, y }
   }
 
@@ -433,8 +488,8 @@ export class Session {
     }
   }
 
-  private async settle(ref: string): Promise<void> {
-    await this.eval(settleExpression(ref)).catch(() => {})
+  private async settle(target: Target): Promise<void> {
+    await this.eval(settleExpression(target)).catch(() => {})
   }
 }
 

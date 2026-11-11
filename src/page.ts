@@ -258,6 +258,25 @@ interface ElementRef {
   id: number
 }
 
+/** A ref from a snapshot, or a CSS selector for a node the snapshot never listed. */
+export type Target = { ref: string } | { selector: string }
+
+const REF = /^e\d+-[a-z0-9]+$/
+
+/**
+ * A ref is `e<node id>-<document token>`; anything else is read as a CSS selector.
+ * Selectors exist for what the element table leaves out, such as a file input a
+ * styled button opens, or a div that only carries a click handler.
+ */
+export function parseTarget(target: string): Target {
+  const wanted = target.trim()
+  if (!wanted) fail('NOT_INTERACTABLE', 'An element ref or a CSS selector is required')
+  if (REF.test(wanted)) return { ref: wanted }
+  // A typo in a ref should say so instead of turning into a failed selector lookup.
+  if (/^e\d/.test(wanted)) fail('STALE', `Malformed element ref ${wanted}; take a new snapshot`)
+  return { selector: wanted }
+}
+
 /** The expression that reads the live nodes the action helpers resolve later. */
 export function snapshotExpression(limit: number): string {
   return `(${SOURCE})(${limit})`
@@ -270,27 +289,32 @@ function splitRef(ref: string): ElementRef {
   return { token: match[2], id: Number(match[1]) }
 }
 
-/** Opens an expression that returns `{ reason }` when the ref no longer points at a live node. */
-function locate(ref: string): string {
-  const { token, id } = splitRef(ref)
+/** Declares `element`, or returns `{ reason }` when the target no longer points at a live node. */
+function locate(target: Target): string {
+  if ('selector' in target) {
+    return `let element = null
+    try { element = document.querySelector(${JSON.stringify(target.selector)}) } catch (error) { return { reason: 'bad-selector' } }
+    if (!element || !element.isConnected) return { reason: 'gone' }`
+  }
+  const { token, id } = splitRef(target.ref)
   return `const cache = window.__chromeUse
     if (!cache || cache.token !== ${JSON.stringify(token)}) return { reason: 'gone' }
     const element = cache.nodes.get(${id})
     if (!element || !element.isConnected) return { reason: 'gone' }`
 }
 
-/** Evaluates to the live node behind a ref, which is what the DOM domain wants. */
-export function nodeExpression(ref: string): string {
+/** Evaluates to the live node behind a target, which is what the DOM domain wants. */
+export function nodeExpression(target: Target): string {
   return `(() => {
-    ${locate(ref)}
+    ${locate(target)}
     return element
   })()`
 }
 
-/** Resolves a ref into a clickable point, scrolling it into view first. */
-export function resolveExpression(ref: string): string {
+/** Resolves a target into a clickable point, scrolling it into view first. */
+export function resolveExpression(target: Target): string {
   return `(async () => {
-    ${locate(ref)}
+    ${locate(target)}
     if (element.matches(':disabled') || element.closest('[aria-disabled="true"],[inert]')) return { reason: 'disabled' }
     ${OFFSET}
     ${POINT}
@@ -321,10 +345,10 @@ export function resolveExpression(ref: string): string {
 }
 
 /** Picks a native select option through the DOM, since mouse clicks cannot pick one deterministically. */
-export function selectExpression(ref: string, value: string): string {
+export function selectExpression(target: Target, value: string): string {
   const wanted = JSON.stringify(value)
   return `(() => {
-    ${locate(ref)}
+    ${locate(target)}
     if (element.tagName !== 'SELECT') return { reason: 'not-select' }
     if (![...element.options].some((option) => option.value === ${wanted})) return { reason: 'no-option' }
     element.value = ${wanted}
@@ -335,11 +359,13 @@ export function selectExpression(ref: string, value: string): string {
 }
 
 /** Waits two animation frames, or until a combobox lists visible options, capped at 200ms. */
-export function settleExpression(ref: string): string {
-  const { id } = splitRef(ref)
+export function settleExpression(target: Target): string {
+  const field =
+    'selector' in target
+      ? `document.querySelector(${JSON.stringify(target.selector)})`
+      : `((window.__chromeUse || {}).nodes || new Map()).get(${splitRef(target.ref).id})`
   return `new Promise((resolve) => {
-    const cache = window.__chromeUse
-    const field = cache && cache.nodes.get(${id})
+    const field = ${field}
     const autocomplete = !!field && field.getAttribute && field.getAttribute('role') === 'combobox'
     let frames = 0
     let stopped = false

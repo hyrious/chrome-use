@@ -27,11 +27,11 @@ const USAGE = `chrome-use: drive the user's own headed Chrome over CDP.
   chrome-use status [--json]
   chrome-use snap [--tab id] [--json] [--limit 250]
   chrome-use open <url> [--tab id] [--json]
-  chrome-use click <ref> [--json]
-  chrome-use type <ref> <text> [--json]
-  chrome-use select <ref> <value> [--json]
-  chrome-use upload <ref> <file>...
-  chrome-use press <key>
+  chrome-use click <ref|selector> [--json]
+  chrome-use type <ref|selector> <text> [--json]
+  chrome-use select <ref|selector> <value> [--json]
+  chrome-use upload <ref|selector> <file>...
+  chrome-use press <key>              # Enter, Tab, or a chord like Control+a
   chrome-use eval '<js>'                 # expression in the page
   chrome-use js [code] [-f|--file path]  # script in node, with cu bound to the session
   chrome-use screenshot [file] [--full]
@@ -42,6 +42,10 @@ const USAGE = `chrome-use: drive the user's own headed Chrome over CDP.
                       [--text-base-url url] [--text-api-key key] [--text-model name]
                       [--dry-run] [--json]
   chrome-use skill
+
+Click, type, select and upload take a ref from snap, or a CSS selector for what
+snap leaves out: a file input a styled button opens, a div that only carries a
+click handler, or a form control on a page too long to snapshot in one view.
 
 Every command accepts --tab <id|prefix|index> and the model commands read
 CHROME_USE_JEV_BASE_URL / CHROME_USE_JEV_API_KEY / CHROME_USE_JEV_MODEL and

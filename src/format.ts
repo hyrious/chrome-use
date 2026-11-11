@@ -13,7 +13,7 @@ export function printSnapshot(snap: Snapshot, asJson: boolean): void {
     const operations = element.operations.join(',')
     const value = element.value ? `  value=${JSON.stringify(element.value)}` : ''
     const states = [element.checked, element.selected, element.expanded]
-      .map((state, i) => (state && state != 'false' ? `  ${['checked', 'selected', 'expanded'][i]}=${state}` : ''))
+      .map((state, i) => (state && state !== 'false' ? `  ${['checked', 'selected', 'expanded'][i]}=${state}` : ''))
       .join('')
     console.log(
       `${element.ref.padEnd(width)}  ${element.role.padEnd(11)}  ${JSON.stringify(element.label)}  ${operations}${value}${states}`,
