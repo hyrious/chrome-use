@@ -1,0 +1,44 @@
+{
+  "name": "@hyrious/chrome-use",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Drive the user's own headed Chrome over CDP, with generated decision requests for Jev.",
+  "author": "hyrious <hyrious@outlook.com>",
+  "license": "MIT",
+  "repository": "hyrious/chrome-use",
+  "keywords": [
+    "chrome",
+    "cdp",
+    "browser",
+    "agent",
+    "jev"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "chrome-use": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "skills"
+  ],
+  "scripts": {
+    "build": "tsc -p .",
+    "fix": "biome check --write --unsafe . && tsc -p . --noEmit && tsc -p scripts",
+    "test": "node --test scripts/unit.ts",
+    "smoke": "node scripts/smoke.ts",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.6",
+    "@hyrious/configs": "^0.1.6",
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
+}
