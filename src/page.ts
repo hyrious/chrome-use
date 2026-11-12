@@ -175,17 +175,15 @@ const SOURCE = String.raw`(limit) => {
     if (length >= 6000) return
     const parent = node.parentElement
     if (!parent) return
+    const text = node.textContent.trim()
+    if (!text) return
     const doc = parent.ownerDocument
     const view = doc.defaultView
-    // The block is the cheap pre filter: text below the fold never needs a range.
+    // The block box is the cheap geometric filter: one element rect, where the
+    // per node range below costs more to build and measure. Most text on a large
+    // page fails here, and the two tests agree on what is on screen.
     const box = parent.getBoundingClientRect()
     if (box.width <= 0 || box.height <= 0 || box.bottom <= 0 || box.top >= view.innerHeight || box.right <= 0 || box.left >= view.innerWidth) return
-    const text = node.textContent.trim()
-    if (!text || parent.closest('script,style,noscript,template') || !visible(parent)) return
-    // Skip links are clipped to a pixel, but their text range still measures big.
-    const style = view.getComputedStyle(parent)
-    if (style.clip != 'auto' || style.clipPath != 'none') return
-    if (style.cursor == 'pointer' && !isCandidate(parent)) markPointer(parent)
     let range = ranges.get(doc)
     if (!range) {
       range = doc.createRange()
@@ -193,14 +191,22 @@ const SOURCE = String.raw`(limit) => {
     }
     range.selectNodeContents(node)
     const rect = range.getBoundingClientRect()
-    if (rect.width <= 0 || rect.height <= 0 || rect.right <= 0 || rect.bottom <= 0 || rect.left >= view.innerWidth || rect.top >= view.innerHeight) return
-    const offset = offsetOf(parent)
-    const x = rect.x + offset.x
-    const y = rect.y + offset.y
-    if (y + rect.height > 0 && y < innerHeight && x + rect.width > 0 && x < innerWidth) {
-      words.push(text)
-      length += text.length
+    if (rect.width <= 0 || rect.height <= 0 || rect.right <= 0 || rect.bottom <= 0 || rect.left >= innerWidth || rect.top >= innerHeight) return
+    if (parent.closest('script,style,noscript,template') || !visible(parent)) return
+    // Skip links are clipped to a pixel, but their text range still measures big.
+    const style = view.getComputedStyle(parent)
+    if (style.clip != 'auto' || style.clipPath != 'none') return
+    if (style.cursor == 'pointer' && !isCandidate(parent)) markPointer(parent)
+    // A rect is reported in its frame's own viewport, so only a node inside one
+    // needs the ancestor walk that maps it onto the outermost viewport.
+    if (doc !== document) {
+      const offset = offsetOf(parent)
+      const x = rect.x + offset.x
+      const y = rect.y + offset.y
+      if (y + rect.height <= 0 || y >= innerHeight || x + rect.width <= 0 || x >= innerWidth) return
     }
+    words.push(text)
+    length += text.length
   }
 
   const walk = (root) => {
@@ -246,6 +252,7 @@ const SOURCE = String.raw`(limit) => {
         context: context || undefined,
         operations: [],
         value: options.value || '',
+        hidden: options.hidden || undefined,
       }, options.state)
       index.set(ref, entry)
       elements.push(entry)
@@ -305,6 +312,15 @@ const SOURCE = String.raw`(limit) => {
     add(element, 'clickable', 'click', label, { action: { value: '' } })
   }
 
+  // A styled upload box hides the input it opens with display or opacity, which
+  // leaves it out of the walk above. Its ref still works, so it is listed anyway:
+  // an upload the table never offered is a step the caller cannot take.
+  for (const element of document.querySelectorAll('input[type=file]')) {
+    if (index.has('e' + identity(element) + '-' + cache.token)) continue
+    const label = (nameOf(element, new Set()) || element.getAttribute('name') || element.id || 'file')
+      .replace(/\s+/g, ' ').trim()
+    add(element, 'file', 'upload', label, { value: '', hidden: true })
+  }
 
   return {
     url: location.href,
@@ -492,46 +508,30 @@ export function hitExpression(x: number, y: number): string {
   })()`
 }
 
-/** Picks a native select option through the DOM, since mouse clicks cannot pick one deterministically. */
+/**
+ * Picks a native select option through the DOM, since a click only opens a popup
+ * the browser draws outside the page. A value that is not there reports the
+ * options that are, which is what makes a near miss fixable in one retry.
+ */
 export function selectExpression(target: Target, value: string): string {
   const wanted = JSON.stringify(value)
   return `(() => {
     ${locate(target)}
     if (element.tagName !== 'SELECT') return { reason: 'not-select' }
-    if (![...element.options].some((option) => option.value === ${wanted})) return { reason: 'no-option' }
-    element.value = ${wanted}
+    const fold = (text) => text.replace(/\\s+/g, ' ').trim().toLowerCase()
+    const options = [...element.options].filter((option) => !option.disabled)
+    const matches = (option) => fold(option.value) === fold(${wanted}) || fold(option.label) === fold(${wanted})
+    const starts = options.filter((option) => fold(option.label).startsWith(fold(${wanted})))
+    const option = options.find(matches) || (starts.length === 1 ? starts[0] : undefined)
+    if (!option) {
+      return {
+        reason: starts.length > 1 ? 'ambiguous-option' : 'no-option',
+        options: (starts.length > 1 ? starts : options).slice(0, 40).map((option) => option.label),
+      }
+    }
+    element.value = option.value
     element.dispatchEvent(new Event('input', { bubbles: true }))
     element.dispatchEvent(new Event('change', { bubbles: true }))
-    return { ok: true }
+    return { ok: true, value: option.value, label: option.label }
   })()`
-}
-
-/** Waits two animation frames, or until a combobox lists visible options, capped at 200ms. */
-export function settleExpression(target: Target): string {
-  const field =
-    'selector' in target
-      ? `document.querySelector(${JSON.stringify(target.selector)})`
-      : `((window.__chromeUse || {}).nodes || new Map()).get(${splitRef(target.ref).id})`
-  return `new Promise((resolve) => {
-    const field = ${field}
-    const autocomplete = !!field && field.getAttribute && field.getAttribute('role') === 'combobox'
-    let frames = 0
-    let stopped = false
-    const finish = () => { stopped = true; resolve(true) }
-    setTimeout(finish, autocomplete ? 200 : 50)
-    const ready = () => {
-      if (stopped) return
-      const ids = (field && field.getAttribute ? (field.getAttribute('aria-controls') || field.getAttribute('aria-owns') || '') : '').split(/s+/).filter(Boolean)
-      const roots = ids.length ? ids.map((id) => document.getElementById(id)).filter(Boolean) : [document]
-      const options = roots.flatMap((root) => [...root.querySelectorAll('[role="option"]')])
-      const found = !autocomplete || options.some((option) => {
-        const rect = option.getBoundingClientRect()
-        return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < innerHeight &&
-          option.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
-      })
-      if (++frames >= 2 && found) finish()
-      else requestAnimationFrame(ready)
-    }
-    requestAnimationFrame(ready)
-  })`
 }

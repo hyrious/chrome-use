@@ -202,7 +202,8 @@ function snapshotCommand(name: string): Command {
 async function pressCommand(args: Args): Promise<void> {
   const key = args.positionals[0]
   if (!key) fail('NOT_INTERACTABLE', 'press needs a key')
-  await withSession(args, (session) => session.press(key))
+  const snap = await withSession(args, (session) => session.press(key))
+  printSnapshot(snap, booleanFlag(args, '--json'))
 }
 
 async function evalCommand(args: Args): Promise<void> {

@@ -90,10 +90,16 @@ export interface ModelConfig {
   timeout?: number
 }
 
+/** True when the operation has at least one target, without building the key array to count it. */
+function hasTargets(table: ActionTable, operation: Operation): boolean {
+  for (const _ in table.targets[operation]) return true
+  return false
+}
+
 function operationCriteria(table: ActionTable): Record<string, string> {
   const criteria: Record<string, string> = {}
   for (const operation of OPERATIONS) {
-    if (Object.keys(table.targets[operation]).length) criteria[operation] = OPERATION_LABELS[operation]
+    if (hasTargets(table, operation)) criteria[operation] = OPERATION_LABELS[operation]
   }
   for (const control of Object.values(table.controls)) criteria[control.key] = control.label
   criteria.DONE = 'Every requirement is visibly satisfied.'
@@ -148,7 +154,7 @@ export function buildRequest(options: BuildRequestOptions): SystemOneRequest {
     },
   }
   for (const operation of OPERATIONS) {
-    if (Object.keys(table.targets[operation]).length) {
+    if (hasTargets(table, operation)) {
       questions[`${operation.toLowerCase()}_target`] = targetCriteria(operation, table, goal, elements)
     }
   }
@@ -205,7 +211,7 @@ function isProbability(value: unknown): value is number {
 function offeredOperations(table: ActionTable): string[] {
   const offered: string[] = []
   for (const operation of OPERATIONS) {
-    if (Object.keys(table.targets[operation]).length) offered.push(operation)
+    if (hasTargets(table, operation)) offered.push(operation)
   }
   return [...offered, ...Object.keys(table.controls), 'DONE', 'BLOCKED']
 }

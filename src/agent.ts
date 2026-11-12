@@ -1,7 +1,7 @@
 import type { ControlAction } from './actions.ts'
 import type { Decision, HistoryEntry, ModelConfig, SystemOneRequest } from './decide.ts'
 import type { Session, TabInfo } from './session.ts'
-import type { Snapshot, SnapshotAction } from './snapshot.ts'
+import type { Outcome, Snapshot, SnapshotAction } from './snapshot.ts'
 
 import { collectActions } from './actions.ts'
 import { buildRequest, endpointOf, postJson, readDecision, readTextAnswer } from './decide.ts'
@@ -77,6 +77,12 @@ interface AdvanceInput {
   files: string[] | undefined
   limit: number
   previousUrl: string
+}
+
+interface Advanced {
+  snap: Snapshot
+  /** What the step did to the page, or null for a control, which is progress by definition. */
+  outcome: Outcome | null
 }
 
 const LOOP_HINT =
@@ -184,17 +190,20 @@ async function pollNewTabs(session: Session, before: Set<string>): Promise<TabIn
   return []
 }
 
-async function runControl(session: Session, control: ControlAction, limit: number): Promise<Snapshot> {
+async function runControl(session: Session, control: ControlAction, limit: number): Promise<Advanced> {
   if (control.kind === 'switch') await session.use(control.tabId)
   else if (control.kind === 'scroll') await session.eval(`window.scrollBy(0, ${control.delta})`)
   else if (control.kind === 'back') {
     await session.eval('history.back()')
     await session.waitForReady(5)
   } else await session.waitForIdle({ maxTime: 2 })
-  return await session.snap({ limit })
+  const snap = await session.snap({ limit })
+  // A scroll changes what is visible without changing the page, so no probe can
+  // say whether it worked. A control is progress until the page says otherwise.
+  return { snap, outcome: null }
 }
 
-async function advance({ session, decision, text, files, limit, previousUrl }: AdvanceInput): Promise<Snapshot> {
+async function advance({ session, decision, text, files, limit, previousUrl }: AdvanceInput): Promise<Advanced> {
   try {
     if (decision.control) return await runControl(session, decision.control, limit)
     const action = decision.action
@@ -207,16 +216,19 @@ async function advance({ session, decision, text, files, limit, previousUrl }: A
     if (opened.length === 1) {
       await session.use(opened[0].id)
       await session.waitForReady(3)
-      return await session.snap({ limit })
+      const snap = await session.snap({ limit })
+      return { snap, outcome: { kind: 'navigated', url: snap.url } }
     }
     if (next.url !== previousUrl) {
       await session.waitForReady(3)
-      return await session.snap({ limit })
+      const snap = await session.snap({ limit })
+      return { snap, outcome: { kind: 'navigated', url: snap.url } }
     }
-    return next
+    return { snap: next, outcome: next.outcome ?? { kind: 'changed', url: next.url } }
   } catch (error) {
     if (error instanceof ChromeUseError && (error.code === 'STALE' || error.code === 'NOT_INTERACTABLE')) {
-      return await session.snap({ limit })
+      const snap = await session.snap({ limit })
+      return { snap, outcome: { kind: 'none', url: snap.url } }
     }
     throw error
   }
@@ -345,8 +357,8 @@ export async function run(session: Session, options: RunOptions): Promise<RunRes
     }
 
     const next = await advance({ session, decision, text, files, limit, previousUrl: state.snap.url })
-    const nextKey = fingerprint(next)
-    const record = historyEntry(decision, text, next, nextKey !== state.key)
+    const nextKey = fingerprint(next.snap)
+    const record = historyEntry(decision, text, next.snap, next.outcome === null || next.outcome.kind !== 'none')
     if (files) record.text = files.join(', ')
     state.history.push(record)
     options.onStep?.({
@@ -365,12 +377,12 @@ export async function run(session: Session, options: RunOptions): Promise<RunRes
     const visits = (state.visits.get(nextKey) ?? 0) + 1
     state.visits.set(nextKey, visits)
     if (visits >= 3) {
-      return result('blocked', state, next.url, { hint: LOOP_HINT })
+      return result('blocked', state, next.snap.url, { hint: LOOP_HINT })
     }
     if (stuck(state.history)) {
-      return result('blocked', state, next.url, { hint: hintFor(next) })
+      return result('blocked', state, next.snap.url, { hint: hintFor(next.snap) })
     }
-    state.snap = next
+    state.snap = next.snap
     state.key = nextKey
   }
 

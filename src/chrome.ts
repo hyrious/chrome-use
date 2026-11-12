@@ -188,7 +188,8 @@ function spawnChrome(chrome: string, args: string[]): ChildProcess {
 
 function reuseRunning(port: number, chrome: string, profile: string, wsUrl: string): StartResult {
   // Chrome is already up, but the state file can be gone (new shell, cleaned home),
-  // so it is rewritten here for the commands that follow.
+  // so it is rewritten here for the commands that follow. The remembered tab is
+  // kept: losing it would send the next command to whichever tab Chrome lists first.
   const stored = readState()
   const existing = stored?.port === port ? stored : null
   const state: AppState = {
@@ -197,6 +198,7 @@ function reuseRunning(port: number, chrome: string, profile: string, wsUrl: stri
     chrome: existing?.chrome ?? chrome,
     profile: existing?.profile ?? profile,
     startedAt: existing?.startedAt ?? new Date().toISOString(),
+    tab: existing?.tab,
   }
   writeState(state)
   return { ...state, wsUrl, reused: true }

@@ -13,6 +13,7 @@ export interface ElementEntry {
   checked?: string
   selected?: string
   expanded?: string
+  hidden?: boolean
 }
 
 interface ScrollControl {
@@ -100,6 +101,7 @@ function entryOf(element: SnapshotElement): ElementEntry {
     checked: element.checked,
     selected: element.selected,
     expanded: element.expanded,
+    hidden: element.hidden,
   }
 }
 

@@ -1,12 +1,13 @@
 import type { TargetInfo } from './cdp.ts'
 import type { Target } from './page.ts'
-import type { Snapshot, SnapshotAction } from './snapshot.ts'
+import type { Snapshot, SnapshotAction, SnapshotResult } from './snapshot.ts'
 
 import { writeFile } from 'node:fs/promises'
 import { basename } from 'node:path'
 
 import { browserInfo, CDP, listTargets } from './cdp.ts'
 import { ChromeUseError, fail } from './errors.ts'
+import { isNavigating, Liveness } from './liveness.ts'
 import {
   filesExpression,
   hitExpression,
@@ -15,7 +16,6 @@ import {
   readValueExpression,
   resolveExpression,
   selectExpression,
-  settleExpression,
   snapshotExpression,
   textCheckExpression,
 } from './page.ts'
@@ -166,6 +166,21 @@ function pickTarget(targets: TargetInfo[], wanted?: string): TargetInfo {
   return found
 }
 
+/**
+ * The tab `start` opened, once it is listed. Chrome lists a new target a moment
+ * after it is created, so a remembered tab is waited for rather than passed over
+ * in favor of whichever tab happens to be first.
+ */
+async function findRemembered(port: number, remembered: string | undefined, timeout = 2000): Promise<TargetInfo | undefined> {
+  if (!remembered) return undefined
+  const deadline = Date.now() + timeout
+  while (true) {
+    const found = matchTarget(await listTargets(port), remembered)
+    if (found || Date.now() >= deadline) return found
+    await delay(50)
+  }
+}
+
 /** One attached tab: actions, snapshots, and the raw protocol behind them. */
 export class Session {
   readonly port: number
@@ -175,23 +190,26 @@ export class Session {
   private dialogs = 0
   private dialog?: string
   private detach: () => void
+  /** What is known about whether the attached tab has finished reacting. */
+  private readonly live: Liveness
 
   private constructor(cdp: CDP, sessionId: string, port: number, targetId: string) {
     this.cdp = cdp
     this.sessionId = sessionId
     this.port = port
     this.targetId = targetId
+    this.live = new Liveness({ evaluate: (expression) => this.eval(expression) })
     this.detach = cdp.on((event) => {
       if (event.sessionId !== sessionId) return
-      if (event.method === 'Page.javascriptDialogOpening') {
-        // The page asked something. Accept it, like a user who pressed the button
-        // expected, but keep the words: a tool that swallows a "delete everything?"
-        // leaves the caller with no way to notice.
-        const { type, message } = event.params as { type?: string; message?: string }
-        this.dialogs++
-        this.dialog = `${type ?? 'dialog'} ${JSON.stringify(message ?? '')}`
-        cdp.send('Page.handleJavaScriptDialog', { accept: true }, sessionId).catch(() => {})
-      }
+      this.live.observe(event)
+      if (event.method !== 'Page.javascriptDialogOpening') return
+      // The page asked something. Accept it, like a user who pressed the button
+      // expected, but keep the words: a tool that swallows a "delete everything?"
+      // leaves the caller with no way to notice.
+      const { type, message } = event.params as { type?: string; message?: string }
+      this.dialogs++
+      this.dialog = `${type ?? 'dialog'} ${JSON.stringify(message ?? '')}`
+      cdp.send('Page.handleJavaScriptDialog', { accept: true }, sessionId).catch(() => {})
     })
   }
 
@@ -207,7 +225,7 @@ export class Session {
     const remembered = options.tab ?? state?.tab
     const target = options.tab
       ? pickTarget(targets, options.tab)
-      : (remembered && matchTarget(targets, remembered)) || targets[0] || (await createPage(cdp))
+      : ((await findRemembered(port, remembered)) ?? targets[0] ?? (await createPage(cdp)))
     const session = new Session(cdp, await cdp.attach(target.id), port, target.id)
     await session.enable()
     // The tab may still be loading a page the caller just opened.
@@ -235,8 +253,19 @@ export class Session {
   async snap(options: SnapOptions = {}): Promise<Snapshot> {
     const limit = options.limit ?? 250
     for (let attempt = 0; attempt < 20; attempt++) {
-      const value = await this.eval<Omit<Snapshot, 'dialogs' | 'dialog'> | null>(snapshotExpression(limit))
-      if (value) return { ...value, dialogs: this.dialogs, ...(this.dialog ? { dialog: this.dialog } : {}) }
+      let value: Omit<Snapshot, 'dialogs' | 'dialog'> | null = null
+      try {
+        value = await this.eval(snapshotExpression(limit))
+      } catch (error) {
+        // The document was replaced while it was being read: read the new one.
+        if (!isNavigating(error)) throw error
+      }
+      // A null means the document has no body yet, which is only true mid-navigation.
+      if (value) {
+        const snap: Snapshot = { ...value, dialogs: this.dialogs }
+        if (this.dialog) snap.dialog = this.dialog
+        return snap
+      }
       await delay(50)
     }
     fail('STALE', 'The page never settled; take a new snapshot')
@@ -254,15 +283,19 @@ export class Session {
       throw error
     })
     await this.waitForReady(15)
+    // readyState says the document is complete, not that the page has stopped
+    // fetching; a landing page often renders its first result after that.
+    await this.live.settle({ cap: 1500 })
     // Chrome keeps the scroll position when the same url is opened twice, which
     // hides the top of the page from the next snapshot.
     await this.eval('window.scrollTo(0, 0)').catch(() => {})
     const landed = await this.eval<string>('location.href').catch(() => '')
     if (landed.startsWith('chrome-error://')) {
       await this.stopLoading()
+      const reason = this.live.failure ? ` (${this.live.failure})` : ''
       fail(
         'NETWORK',
-        `Chrome cannot load ${url}; it shows an error page. If the network needs a proxy, restart it: chrome-use stop && chrome-use start -x <proxy>`,
+        `Chrome cannot load ${url}${reason}; it shows an error page. If the network needs a proxy, restart it: chrome-use stop && chrome-use start -x <proxy>`,
       )
     }
     return this.snap()
@@ -284,14 +317,12 @@ export class Session {
     }
   }
 
-  async click(target: string): Promise<Snapshot> {
+  async click(target: string): Promise<SnapshotResult> {
     const wanted = parseTarget(target)
-    await this.mouse(await this.pointOf(wanted))
-    await this.settle(wanted)
-    return this.snap()
+    return await this.acted(async () => this.mouse(await this.pointOf(wanted)))
   }
 
-  async type(target: string, text: string): Promise<Snapshot> {
+  async type(target: string, text: string): Promise<SnapshotResult> {
     const wanted = parseTarget(target)
     const name = 'ref' in wanted ? wanted.ref : wanted.selector
     const check = await this.eval<{ reason?: string; max?: number }>(textCheckExpression(wanted, text))
@@ -304,29 +335,28 @@ export class Session {
     if (check.reason === 'structured')
       fail('NOT_INTERACTABLE', `Element ${name} is a segmented date field; set its value with eval instead of typing`)
     if (check.reason === 'too-long') fail('NOT_INTERACTABLE', `Element ${name} accepts at most ${check.max} characters`)
-    await this.mouse(await this.pointOf(wanted))
-    // Select what is already there first, so typing replaces instead of appending.
-    // An empty text clears the field, which is the only way to say "no value".
-    const selectAll = process.platform === 'darwin' ? 'Meta+a' : 'Control+a'
-    await this.dispatchChord(parseChord(selectAll))
-    if (text) await this.cdp.send('Input.insertText', { text }, this.sessionId)
-    else await this.dispatchChord(parseChord('Backspace'))
-    await this.settle(wanted)
+    const snapshot = await this.acted(async () => {
+      await this.mouse(await this.pointOf(wanted))
+      // Select what is already there first, so typing replaces instead of appending.
+      // An empty text clears the field, which is the only way to say "no value".
+      const selectAll = process.platform === 'darwin' ? 'Meta+a' : 'Control+a'
+      await this.dispatchChord(parseChord(selectAll))
+      if (text) await this.cdp.send('Input.insertText', { text }, this.sessionId)
+      else await this.dispatchChord(parseChord('Backspace'))
+    })
     // Text a controlled input drops is a failed fill, not a filled field.
-    const read = await this.eval<{ value?: string; secret?: boolean }>(readValueExpression(wanted))
-    if (read.value !== undefined && squash(read.value) !== squash(text)) {
-      const shown = read.secret ? '•'.repeat(read.value.length) : read.value.slice(0, 60)
+    const held = await this.eval<{ value?: string; secret?: boolean }>(readValueExpression(wanted))
+    if (held.value !== undefined && squash(held.value) !== squash(text)) {
+      const shown = held.secret ? '•'.repeat(held.value.length) : held.value.slice(0, 60)
       fail('INPUT_MISMATCH', `Element ${name} shows ${JSON.stringify(shown)} after typing; the page changed the value`)
     }
-    return this.snap()
+    return snapshot
   }
 
   /** Moves the pointer over a target and leaves it there, for menus that open on hover. */
-  async hover(target: string): Promise<Snapshot> {
+  async hover(target: string): Promise<SnapshotResult> {
     const wanted = parseTarget(target)
-    await this.mouse(await this.pointOf(wanted), true)
-    await this.settle(wanted)
-    return this.snap()
+    return await this.acted(async () => this.mouse(await this.pointOf(wanted), true))
   }
 
   /**
@@ -343,82 +373,92 @@ export class Session {
       )
     const hit = await this.eval<string | null>(hitExpression(x, y))
     if (!hit) fail('NOT_INTERACTABLE', `Nothing is at ${x},${y}; take a new screenshot`)
-    if (!options.dryRun) await this.mouse({ x, y })
-    const snap = await this.snap()
-    return { ...snap, hit }
+    if (options.dryRun) return { ...(await this.snap()), hit }
+    return { ...(await this.acted(() => this.mouse({ x, y }))), hit }
   }
 
-  async select(target: string, value: string): Promise<Snapshot> {
+  async select(target: string, value: string): Promise<SnapshotResult> {
     const wanted = parseTarget(target)
-    const result = await this.eval<{ reason?: string }>(selectExpression(wanted, value))
-    if (result.reason === 'gone') fail('STALE', `Element ${target} is gone; take a new snapshot`)
-    if (result.reason === 'bad-selector') fail('NOT_INTERACTABLE', `${target} is not a valid CSS selector`)
-    if (result.reason === 'not-select') fail('NOT_INTERACTABLE', `Element ${target} is not a native select`)
-    if (result.reason === 'no-option')
-      fail('NOT_INTERACTABLE', `Element ${target} has no option with value ${JSON.stringify(value)}`)
-    await this.settle(wanted)
+    const name = 'ref' in wanted ? wanted.ref : wanted.selector
+    const snapshot = await this.acted(async () => {
+      const result = await this.eval<{ reason?: string; options?: string[] }>(selectExpression(wanted, value))
+      if (result.reason === 'gone') fail('STALE', `Element ${target} is gone; take a new snapshot`)
+      if (result.reason === 'bad-selector') fail('NOT_INTERACTABLE', `${target} is not a valid CSS selector`)
+      if (result.reason === 'not-select') fail('NOT_INTERACTABLE', `Element ${target} is not a native select`)
+      if (result.reason === 'no-option' || result.reason === 'ambiguous-option') {
+        const seen = result.options?.length
+          ? `; it offers ${result.options.map((option) => JSON.stringify(option)).join(', ')}`
+          : ''
+        const why = result.reason === 'ambiguous-option' ? 'several options start with' : 'no option matches'
+        fail('NOT_INTERACTABLE', `Element ${name} has ${why} ${JSON.stringify(value)}${seen}`)
+      }
+    })
     // A controlled select can put the old option back after the events fired.
-    const read = await this.eval<{ value?: string }>(readValueExpression(wanted))
-    if (read.value !== undefined && read.value !== value)
+    const shown = await this.eval<{ value?: string }>(readValueExpression(wanted))
+    if (shown.value !== undefined && shown.value !== value)
       fail(
         'INPUT_MISMATCH',
-        `Element ${target} shows ${JSON.stringify(read.value.slice(0, 60))} after selecting; the page did not keep it`,
+        `Element ${target} shows ${JSON.stringify(shown.value.slice(0, 60))} after selecting; the page did not keep it`,
       )
-    return this.snap()
+    return snapshot
   }
 
-  async press(key: string): Promise<Snapshot> {
+  async press(key: string): Promise<SnapshotResult> {
     const chord = parseChord(key)
-    await this.dispatchChord(chord)
-    // Enter and Space often submit, and the page can start moving a moment later.
-    if (chord.name === 'Enter' || chord.name === ' ') {
+    return await this.acted(async () => {
+      await this.dispatchChord(chord)
+      // Enter and Space often submit, and the page can start moving a moment later.
+      if (chord.name !== 'Enter' && chord.name !== ' ') return
       await this.waitForNavigation()
       await this.waitForReady(10)
-    }
-    return this.snap()
+    })
   }
 
   /** A ref from snap, or a CSS selector when the snapshot never listed the node. */
-  async upload(target: string, files: string[]): Promise<Snapshot> {
+  async upload(target: string, files: string[]): Promise<SnapshotResult> {
     const wanted = parseTarget(target)
-    const evaluated = await this.cdp.send<{ result: { objectId?: string }; exceptionDetails?: unknown }>(
-      'Runtime.evaluate',
-      { expression: nodeExpression(wanted), objectGroup: 'chrome-use' },
-      this.sessionId,
-    )
-    const objectId = evaluated.result?.objectId
-    if (!objectId) fail('STALE', `Element ${target} is not on the page any more; take a new snapshot`)
-    try {
-      await this.cdp.send('DOM.setFileInputFiles', { files, objectId }, this.sessionId)
-    } finally {
-      await this.cdp.send('Runtime.releaseObjectGroup', { objectGroup: 'chrome-use' }, this.sessionId).catch(() => {})
-    }
-    await this.settle(wanted)
-    const attached = await this.eval<{ names?: string[]; reason?: string }>(filesExpression(wanted))
-    if (attached.reason === 'not-file') fail('NOT_INTERACTABLE', `Element ${target} is not a file input`)
+    const snapshot = await this.acted(async () => {
+      const evaluated = await this.cdp.send<{ result: { objectId?: string } }>(
+        'Runtime.evaluate',
+        { expression: nodeExpression(wanted), objectGroup: 'chrome-use' },
+        this.sessionId,
+      )
+      const objectId = evaluated.result?.objectId
+      if (!objectId) fail('STALE', `Element ${target} is not on the page any more; take a new snapshot`)
+      try {
+        await this.cdp.send('DOM.setFileInputFiles', { files, objectId }, this.sessionId)
+      } finally {
+        await this.cdp.send('Runtime.releaseObjectGroup', { objectGroup: 'chrome-use' }, this.sessionId).catch(() => {})
+      }
+    })
+    const held = await this.eval<{ names?: string[]; reason?: string }>(filesExpression(wanted))
+    if (held.reason === 'not-file') fail('NOT_INTERACTABLE', `Element ${target} is not a file input`)
     const expected = files.map((file) => basename(file))
-    const actual = attached.names ?? []
+    const actual = held.names ?? []
     if (actual.length !== expected.length || expected.some((name, index) => name !== actual[index]))
       fail(
         'INPUT_MISMATCH',
         `Element ${target} holds ${JSON.stringify(actual)} after the upload; the page did not keep the file(s)`,
       )
-    return this.snap()
+    return snapshot
   }
 
   /** Runs one action that came from a snapshot or a decision. */
-  async act(action: SnapshotAction, text?: string): Promise<Snapshot> {
+  async act(action: SnapshotAction, text?: string): Promise<SnapshotResult> {
     if (action.kind === 'click') return this.click(action.ref)
     if (action.kind === 'select') return this.select(action.ref, action.value)
     if (typeof text !== 'string') fail('NEEDS_TEXT', `No text to type into ${action.label}`)
     return this.type(action.ref, text)
   }
 
-  /** Resolves true on network idle, false when maxTime seconds pass first. */
-  waitForIdle(options: IdleOptions = {}): Promise<boolean> {
-    const maxTime = options.maxTime ?? 3
-    const timeout = new Promise<boolean>((done) => setTimeout(() => done(false), maxTime * 1000))
-    return Promise.race([this.waitForNetworkIdle(), timeout])
+  /**
+   * Resolves true once the page has stopped loading and changing, false when
+   * maxTime seconds pass first. Waits on the same evidence an action does: no
+   * request in flight and no mutation for the quiet window. A page that keeps
+   * polling resolves false rather than hanging.
+   */
+  async waitForIdle(options: IdleOptions = {}): Promise<boolean> {
+    return await this.live.waitForQuiet((options.maxTime ?? 3) * 1000)
   }
 
   /** Polls the page until `expression` is truthy. */
@@ -528,22 +568,12 @@ export class Session {
     await this.cdp.send('DOM.enable', {}, this.sessionId)
     await this.cdp.send('Page.enable', {}, this.sessionId)
     await this.cdp.send('Runtime.enable', {}, this.sessionId)
+    // Network events are what tell an update that only an XHR carried apart from
+    // an action that did nothing.
+    await this.cdp.send('Network.enable', {}, this.sessionId)
     // Page focus is independent of the user's active window and keyboard focus.
     await this.cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }, this.sessionId)
     await this.cdp.send('Page.setLifecycleEventsEnabled', { enabled: true }, this.sessionId)
-  }
-
-  private waitForNetworkIdle(): Promise<boolean> {
-    return new Promise((resolve) => {
-      let off = () => {}
-      off = this.cdp.on((event) => {
-        if (event.sessionId !== this.sessionId) return
-        if (event.method === 'Page.lifecycleEvent' && event.params.name === 'networkIdle') {
-          off()
-          resolve(true)
-        }
-      })
-    })
   }
 
   private async fullPageParams(): Promise<Record<string, unknown>> {
@@ -618,8 +648,17 @@ export class Session {
     }
   }
 
-  private async settle(target: Target): Promise<void> {
-    await this.eval(settleExpression(target)).catch(() => {})
+  /**
+   * Runs one action and returns the snapshot it produced, with what the action
+   * did to the page. Every action goes through here, so an outcome is measured by
+   * the action that caused it instead of inferred from two snapshots by a caller.
+   */
+  private async acted(run: () => Promise<void>): Promise<SnapshotResult> {
+    const before = await this.live.probe()
+    const began = Date.now()
+    await run()
+    const after = await this.live.settle({ since: began })
+    return { ...(await this.snap()), outcome: this.live.outcome(before, after) }
   }
 }
 

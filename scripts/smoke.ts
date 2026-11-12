@@ -20,6 +20,7 @@ import {
   Session,
   start,
   stop,
+  writeState,
 } from '../src/index.ts'
 
 const home = mkdtempSync(join(tmpdir(), 'chrome-use-smoke-'))
@@ -84,6 +85,10 @@ const edge = `<!doctype html><html><head><title>edge</title><style>
 <label for="pick">Pick</label><select id="pick"><option value="a">A</option><option value="b">B</option></select>
 </form>
 <footer onclick="window.wrongClicks = (window.wrongClicks || 0) + 1">sticky footer</footer>
+<input type="file" id="hidden-upload" style="display:none" aria-label="Hidden attachment">
+<button id="noop">Does nothing</button>
+<button id="loading">Loads over the network</button>
+<p id="fetched"></p>
 <script>
   window.clicks = 0
   document.getElementById('visible').onclick = () => window.clicks++
@@ -94,12 +99,19 @@ const edge = `<!doctype html><html><head><title>edge</title><style>
   revert.addEventListener('input', () => { revert.value = 'managed' })
   const pick = document.getElementById('pick')
   pick.addEventListener('change', () => { pick.value = 'a' })
+  // The response arrives 400ms after the click and changes no DOM until then:
+  // only the in-flight request says the click is still doing something.
+  document.getElementById('loading').onclick = async () => {
+    const body = await (await fetch('/slow')).text()
+    document.getElementById('fetched').textContent = body
+  }
 </script>
 </body></html>`
 
 const server = createServer((request, response) => {
   response.writeHead(200, { 'content-type': 'text/html' })
   if (request.url === '/detail') response.end('<!doctype html><title>detail</title><h1>Detail page</h1>')
+  else if (request.url === '/slow') setTimeout(() => response.end('slow result'), 400)
   else if (request.url === '/inner') response.end(inner)
   else if (request.url === '/edge') response.end(edge)
   else response.end(page)
@@ -135,6 +147,11 @@ try {
   rmSync(join(home, 'state.json'), { force: true })
   const reused = await start({ port, profile: join(home, 'profile') })
   check('reuse rewrites state', reused.reused && readState()?.port === port, JSON.stringify(readState()))
+  // A state file that names a tab keeps it: dropping it would send the next
+  // command to whichever tab Chrome happens to list first.
+  writeState({ ...readState()!, tab: 'remembered-tab-id' })
+  await start({ port, profile: join(home, 'profile') })
+  check('reuse keeps the remembered tab', readState()?.tab === 'remembered-tab-id', JSON.stringify(readState()))
 
   const bu = await Session.connect({ port })
   try {
@@ -329,6 +346,32 @@ try {
     check('a region holding a control is left out', !listed.includes('Wrapper card'), JSON.stringify(listed))
     check('the control inside it is listed', listed.includes('Inner action'), JSON.stringify(listed))
 
+    // an action reports what it did instead of leaving it to a diff of two snapshots
+    const noop = findByLabel(await bu.snap(), 'does nothing')
+    const quiet = await bu.click(noop.ref)
+    check('a click that changes nothing says so', quiet.outcome?.kind === 'none', JSON.stringify(quiet.outcome))
+
+    // a response that lands 400ms after the click is still part of the click
+    const fetching = await bu.click(findByLabel(await bu.snap(), 'loads over the network').ref)
+    const fetched = await bu.eval<string>('document.getElementById("fetched").textContent')
+    check('settle waits for the request the click started', fetched === 'slow result', fetched)
+    check(
+      'the late update is reported as a change',
+      fetching.outcome?.kind === 'changed',
+      JSON.stringify(fetching.outcome),
+    )
+
+    // an upload box that hides its input still offers the upload
+    const hidden = (await bu.snap()).elements.find((element) => element.label === 'Hidden attachment')
+    check('a hidden file input is listed', hidden?.hidden === true && hidden.role === 'file', JSON.stringify(hidden))
+    if (hidden) {
+      await bu.upload(hidden.ref, [join(home, 'note.txt')])
+      check(
+        'a hidden file input takes the file',
+        (await bu.eval('document.getElementById("hidden-upload").files[0]?.name')) === 'note.txt',
+      )
+    }
+
     // a canvas has no role, so only a screenshot and a point can reach it
     await bu.eval('document.getElementById("board").scrollIntoView({ block: "center", behavior: "instant" })')
     const box = await bu.eval<{ x: number; y: number; width: number; height: number }>(
@@ -462,7 +505,9 @@ try {
 } finally {
   await stop()
   server.close()
-  rmSync(home, { recursive: true, force: true })
+  // Chrome releases its profile a moment after it exits, so a single unlink can
+  // still hit a locked file on Windows. The run's result is what matters here.
+  rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
 }
 
 console.log(failed ? `\n${failed} check(s) failed` : '\nall checks passed')

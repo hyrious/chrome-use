@@ -37,7 +37,7 @@ export type {
   TabInfo,
   WaitOptions,
 } from './session.ts'
-export type { ScrollState, Snapshot, SnapshotAction, SnapshotElement } from './snapshot.ts'
+export type { Outcome, ScrollState, Snapshot, SnapshotAction, SnapshotElement, SnapshotResult } from './snapshot.ts'
 export type { AppState } from './state.ts'
 
 export { collectActions } from './actions.ts'

@@ -9,6 +9,8 @@ export interface SnapshotElement {
   checked?: string
   selected?: string
   expanded?: string
+  /** A file input a styled upload box hides; its ref still takes an upload. */
+  hidden?: boolean
 }
 
 export interface SnapshotAction {
@@ -22,6 +24,20 @@ export interface SnapshotAction {
 export interface ScrollState {
   y: number
   height: number
+}
+
+/** What a single action did to the page, so a caller never has to infer it from a snapshot. */
+export interface Outcome {
+  kind: 'navigated' | 'changed' | 'none'
+  url: string
+  /** The network error behind a chrome-error page, such as ERR_NAME_NOT_RESOLVED. */
+  error?: string
+}
+
+/** A snapshot taken right after an action, with what that action did. */
+export interface SnapshotResult extends Snapshot {
+  /** Filled in by click, hover, type, select, upload and press; absent from a plain snap. */
+  outcome?: Outcome
 }
 
 export interface Snapshot {
