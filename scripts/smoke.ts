@@ -57,10 +57,51 @@ const rawPage = `<!doctype html><html><head><title>fixture</title></head><body s
 const inner = `<!doctype html><title>inner</title>
 <button onclick="parent.document.getElementById('deep-out').textContent='inner'">Inner button</button>`
 
+// Scroll position, occlusion, hover menus, and fields that refuse what they are given.
+const edge = `<!doctype html><html><head><title>edge</title><style>
+  body { margin: 0; font: 16px sans-serif; height: 3000px }
+  #visible { margin-top: 100px }
+  #covered { position: absolute; left: 0; width: 200px; height: 30px }
+  #hover { display: inline-block; margin-top: 40px }
+  #menu { display: none }
+  #hoverwrap:hover #menu { display: block }
+  .card { cursor: pointer; width: 240px; padding: 6px; border: 1px solid #ccc; margin: 6px }
+  footer { position: fixed; bottom: 0; left: 0; right: 0; height: 140px; background: #fff; border-top: 1px solid #ccc }
+</style></head><body>
+<button id="visible">Visible button</button>
+<button id="covered">Covered button</button>
+<span id="hoverwrap"><span id="hover">Hover me</span>
+<div id="menu" role="menu"><button role="menuitem" onclick="window.menu = 1">Menu item</button></div></span>
+<div class="card" id="card" onclick="window.cardClicks = (window.cardClicks || 0) + 1">Design hotel with free cancellation</div>
+<div class="card" id="wrapper"><span>Wrapper card</span><button onclick="window.innerClicks = 1">Inner action</button></div>
+<canvas id="board" width="160" height="60" style="display:block;margin:8px 0;border:1px solid #333" onclick="window.boardClicks = (window.boardClicks || 0) + 1"></canvas>
+<form onsubmit="event.preventDefault()">
+<label for="revert">Revert field</label><input id="revert">
+<label for="scratch">Scratch field</label><input id="scratch">
+<input type="file" id="guard" aria-label="Guarded upload" onchange="this.value = ''">
+<label for="ro">Read only field</label><input id="ro" readonly value="fixed">
+<label for="short">Short field</label><input id="short" maxlength="3">
+<label for="pick">Pick</label><select id="pick"><option value="a">A</option><option value="b">B</option></select>
+</form>
+<footer onclick="window.wrongClicks = (window.wrongClicks || 0) + 1">sticky footer</footer>
+<script>
+  window.clicks = 0
+  document.getElementById('visible').onclick = () => window.clicks++
+  const covered = document.getElementById('covered')
+  covered.style.top = (innerHeight - 30) + 'px'
+  covered.onclick = () => window.clicks++
+  const revert = document.getElementById('revert')
+  revert.addEventListener('input', () => { revert.value = 'managed' })
+  const pick = document.getElementById('pick')
+  pick.addEventListener('change', () => { pick.value = 'a' })
+</script>
+</body></html>`
+
 const server = createServer((request, response) => {
   response.writeHead(200, { 'content-type': 'text/html' })
   if (request.url === '/detail') response.end('<!doctype html><title>detail</title><h1>Detail page</h1>')
   else if (request.url === '/inner') response.end(inner)
+  else if (request.url === '/edge') response.end(edge)
   else response.end(page)
 })
 await new Promise<void>((done) => server.listen(0, () => done()))
@@ -144,7 +185,8 @@ try {
 
     const popup = findByLabel(snap, 'popup')
     snap = await bu.click(popup.ref)
-    check('dialog dismissed and counted', snap.dialogs >= 1, String(snap.dialogs))
+    check('dialog counted', snap.dialogs >= 1, String(snap.dialogs))
+    check('dialog keeps what it said', snap.dialog === 'alert "hi there"', String(snap.dialog))
 
     // a target=_blank link opens a tab; the library never follows it on its own
     const original = bu.targetId
@@ -241,6 +283,157 @@ try {
       dryRun: true,
     })
     check('run dry-run returns request', dry.status === 'dry-run' && !!dry.request, dry.status)
+
+    // acting on a visible element leaves the scroll position alone, and an
+    // element under a sticky footer still gets centered and pressed
+    await bu.open(`${url}edge`)
+    const visible = findByLabel(await bu.snap(), 'visible button')
+    await bu.click(visible.ref)
+    check('a visible click does not scroll', (await bu.eval<number>('scrollY')) === 0, String(await bu.eval('scrollY')))
+    check(
+      'a visible click lands',
+      (await bu.eval<number>('window.clicks')) === 1,
+      String(await bu.eval('window.clicks')),
+    )
+    const covered = findByLabel(await bu.snap(), 'covered button')
+    await bu.click(covered.ref)
+    check(
+      'a covered click lands',
+      (await bu.eval<number>('window.clicks')) === 2,
+      String(await bu.eval('window.clicks')),
+    )
+    check('a covered click never presses the footer', (await bu.eval('window.wrongClicks ?? 0')) === 0)
+
+    // hover opens a menu the snapshot can then act on
+    await bu.hover('#hover')
+    const opened = await bu.snap()
+    const item = opened.elements.find((element) => element.label === 'Menu item')
+    check('hover reveals a menu', !!item, JSON.stringify(opened.elements.map((element) => element.label)))
+    if (item) {
+      await bu.click(item.ref)
+      check('a hovered menu clicks', (await bu.eval('window.menu')) === 1)
+    }
+
+    // a region the page only marked with a pointer cursor is an element too
+    let snap2 = await bu.snap()
+    const card = findByLabel(snap2, 'design hotel')
+    check('a pointer region is listed', card.role === 'clickable', card.role)
+    await bu.click(card.ref)
+    check(
+      'a pointer region clicks',
+      (await bu.eval('window.cardClicks')) === 1,
+      String(await bu.eval('window.cardClicks')),
+    )
+    snap2 = await bu.snap()
+    const listed = snap2.elements.map((element) => element.label)
+    check('a region holding a control is left out', !listed.includes('Wrapper card'), JSON.stringify(listed))
+    check('the control inside it is listed', listed.includes('Inner action'), JSON.stringify(listed))
+
+    // a canvas has no role, so only a screenshot and a point can reach it
+    await bu.eval('document.getElementById("board").scrollIntoView({ block: "center", behavior: "instant" })')
+    const box = await bu.eval<{ x: number; y: number; width: number; height: number }>(
+      'JSON.parse(JSON.stringify(document.getElementById("board").getBoundingClientRect()))',
+    )
+    const pointX = Math.round(box.x + box.width / 2)
+    const pointY = Math.round(box.y + box.height / 2)
+    const look = await bu.point(pointX, pointY, { dryRun: true })
+    check('a point describes its target', look.hit === 'canvas', String(look.hit))
+    check('a dry run presses nothing', (await bu.eval('window.boardClicks ?? 0')) === 0)
+    await bu.point(pointX, pointY)
+    check('a point clicks', (await bu.eval('window.boardClicks')) === 1, String(await bu.eval('window.boardClicks')))
+    let outside: unknown
+    try {
+      await bu.point(-5, 5)
+    } catch (error) {
+      outside = error
+    }
+    check(
+      'a point outside the viewport is rejected',
+      outside instanceof ChromeUseError && outside.code === 'NOT_INTERACTABLE',
+      String(outside),
+    )
+
+    // fields that silently drop or revert the text are failures, not successes
+    let reverted: unknown
+    try {
+      await bu.type(findByLabel(await bu.snap(), 'revert field').ref, 'typed')
+    } catch (error) {
+      reverted = error
+    }
+    check(
+      'a reverted value is reported',
+      reverted instanceof ChromeUseError && reverted.code === 'INPUT_MISMATCH',
+      String(reverted),
+    )
+
+    let readonly: unknown
+    try {
+      await bu.type(findByLabel(await bu.snap(), 'read only field').ref, 'x')
+    } catch (error) {
+      readonly = error
+    }
+    check(
+      'a read only field is rejected',
+      readonly instanceof ChromeUseError && readonly.code === 'NOT_INTERACTABLE',
+      String(readonly),
+    )
+
+    let tooLong: unknown
+    try {
+      await bu.type(findByLabel(await bu.snap(), 'short field').ref, 'abcd')
+    } catch (error) {
+      tooLong = error
+    }
+    check(
+      'a value over maxlength is rejected',
+      tooLong instanceof ChromeUseError && tooLong.code === 'NOT_INTERACTABLE',
+      String(tooLong),
+    )
+
+    let kept: unknown
+    try {
+      await bu.select(findByLabel(await bu.snap(), 'pick').ref, 'b')
+    } catch (error) {
+      kept = error
+    }
+    check(
+      'a select the page reverts is reported',
+      kept instanceof ChromeUseError && kept.code === 'INPUT_MISMATCH',
+      String(kept),
+    )
+
+    // an empty text clears the field, and an upload the page drops is a failure
+    const scratch = findByLabel(await bu.snap(), 'scratch field')
+    await bu.type(scratch.ref, 'abc')
+    const filled = await bu.eval<string>('document.getElementById("scratch").value')
+    check('type fills the field', filled === 'abc', filled)
+    await bu.type(scratch.ref, '')
+    const cleared = await bu.eval<string>('document.getElementById("scratch").value')
+    check('an empty type clears the field', cleared === '', cleared)
+
+    let dropped: unknown
+    try {
+      await bu.upload(findByLabel(await bu.snap(), 'guarded upload').ref, [join(home, 'note.txt')])
+    } catch (error) {
+      dropped = error
+    }
+    check(
+      'a dropped upload is reported',
+      dropped instanceof ChromeUseError && dropped.code === 'INPUT_MISMATCH',
+      String(dropped),
+    )
+
+    // waits poll instead of sleeping
+    await bu.waitForText('sticky footer')
+    await bu.waitForURL(/\/edge$/)
+    await bu.waitFor('document.body !== null')
+    let timedOut: unknown
+    try {
+      await bu.waitFor('false', { maxTime: 0.3 })
+    } catch (error) {
+      timedOut = error
+    }
+    check('waitFor times out', timedOut instanceof ChromeUseError && timedOut.code === 'TIMEOUT', String(timedOut))
 
     // stale ref after a navigation
     const ref = where.ref

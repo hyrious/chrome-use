@@ -11,6 +11,7 @@ export type ErrorCode =
   | 'NO_TARGET'
   | 'STALE'
   | 'NOT_INTERACTABLE'
+  | 'INPUT_MISMATCH'
   | 'EVAL_ERROR'
   | 'SCRIPT_ERROR'
   | 'INVALID_DECISION'

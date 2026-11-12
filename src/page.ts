@@ -30,6 +30,27 @@ const POINT = `function pointOf(element) {
   return { x: (left + right) / 2, y: (top + bottom) / 2 }
 }`
 
+/** Walks up open shadow roots and frames to the root that owns the outermost viewport. */
+const FRAME = `function frameOf(node) {
+  let probe = node
+  let doc = probe.ownerDocument
+  while (probe.getRootNode().host) probe = probe.getRootNode().host
+  while (doc.defaultView && doc.defaultView.frameElement) {
+    probe = doc.defaultView.frameElement
+    doc = probe.ownerDocument
+  }
+  return { probe: probe, doc: doc }
+}`
+
+/** True when every edge of the box sits inside the outermost viewport. */
+const ONSCREEN = `function onScreen(element) {
+  const rect = element.getBoundingClientRect()
+  if (rect.width <= 0 || rect.height <= 0) return false
+  const offset = offsetOf(element)
+  return rect.left + offset.x >= 0 && rect.top + offset.y >= 0 &&
+    rect.right + offset.x <= innerWidth && rect.bottom + offset.y <= innerHeight
+}`
+
 const CLICKABLE = `function clickable(element) {
   if (!element.checkVisibility({ checkVisibilityCSS: true })) return false
   if (element.checkVisibility({ checkOpacity: true })) return true
@@ -48,6 +69,8 @@ const SOURCE = String.raw`(limit) => {
   for (const [id, element] of cache.nodes) if (!element.isConnected) cache.nodes.delete(id)
 
   const ROLES = ['button', 'link', 'checkbox', 'radio', 'switch', 'tab', 'menuitem', 'menuitemradio', 'option', 'gridcell', 'combobox', 'textbox', 'searchbox', 'spinbutton']
+  // What a pointer cursor is not allowed to duplicate: the real control wins.
+  const CONTROL = 'button,a[href],input,select,textarea,summary,[role="button"],[role="link"],[role="menuitem"],[role="option"],[role="tab"],[contenteditable="true"]'
   // Cheaper than matching a selector against every node on a large page.
   const isCandidate = (element) => {
     const tag = element.tagName
@@ -120,10 +143,33 @@ const SOURCE = String.raw`(limit) => {
   // once no matter how large it is, and the text keeps document order across
   // shadow roots and frames.
   const candidates = []
+  const pointers = new Set()
+  const cursors = new Map()
   const words = []
   const ranges = new Map()
   const MAX_CANDIDATES = 800
+  const MAX_POINTERS = 120
   let length = 0
+
+  const cursorOf = (element) => {
+    if (cursors.has(element)) return cursors.get(element)
+    const value = element.ownerDocument.defaultView.getComputedStyle(element).cursor
+    cursors.set(element, value)
+    return value
+  }
+
+  // Cursor inherits, so the region that introduces it is the region that reacts
+  // to a click. Whole cards, rows and custom triggers are clickable without a
+  // role, and a page that sets a pointer cursor on everything collapses to body.
+  const markPointer = (element) => {
+    if (pointers.size >= MAX_POINTERS) return
+    let top = element
+    while (top.parentElement && top.parentElement !== top.ownerDocument.body && cursorOf(top.parentElement) == 'pointer') {
+      top = top.parentElement
+    }
+    if (top.tagName == 'HTML' || top.tagName == 'BODY' || top.closest(CONTROL)) return
+    pointers.add(top)
+  }
 
   const readWords = (node) => {
     if (length >= 6000) return
@@ -139,6 +185,7 @@ const SOURCE = String.raw`(limit) => {
     // Skip links are clipped to a pixel, but their text range still measures big.
     const style = view.getComputedStyle(parent)
     if (style.clip != 'auto' || style.clipPath != 'none') return
+    if (style.cursor == 'pointer' && !isCandidate(parent)) markPointer(parent)
     let range = ranges.get(doc)
     if (!range) {
       range = doc.createRange()
@@ -181,6 +228,32 @@ const SOURCE = String.raw`(limit) => {
   const actions = []
   const index = new Map()
   let truncated = 0
+
+  const add = (element, role, kind, label, options) => {
+    if (actions.length >= limit) {
+      truncated++
+      return
+    }
+    const ref = 'e' + identity(element) + '-' + cache.token
+    const operation = kind === 'click' ? 'CLICK' : kind === 'fill' ? 'TYPE_TEXT' : kind === 'upload' ? 'UPLOAD' : 'SELECT'
+    let entry = index.get(ref)
+    if (!entry) {
+      const context = contextOf(element, label)
+      entry = Object.assign({
+        ref: ref,
+        role: role,
+        label: label,
+        context: context || undefined,
+        operations: [],
+        value: options.value || '',
+      }, options.state)
+      index.set(ref, entry)
+      elements.push(entry)
+    }
+    if (!entry.operations.includes(operation)) entry.operations.push(operation)
+    actions.push(Object.assign({ ref: ref, kind: kind, label: label }, options.action))
+  }
+
   for (const element of candidates) {
     if (!safe(element) || !actionable(element) || element.matches(':disabled') || element.closest('[aria-disabled="true"]')) continue
     const role = roleOf(element)
@@ -190,10 +263,8 @@ const SOURCE = String.raw`(limit) => {
     const point = pointOf(element)
     if (!point) continue
     if (role === 'gridcell' && element.querySelector('button,[role="button"]')) continue
-    const ref = 'e' + identity(element) + '-' + cache.token
     const label = (nameOf(element, new Set()) || element.getAttribute('name') || element.id || role)
       .replace(/\s+/g, ' ').trim()
-    const context = contextOf(element, label)
     const state = {}
     for (const key of ['checked', 'selected', 'expanded']) {
       const aria = element.getAttribute('aria-' + key)
@@ -203,22 +274,7 @@ const SOURCE = String.raw`(limit) => {
     const value = element.type === 'password' ? (element.value ? '••••' : '')
       : 'value' in element ? String(element.value)
       : element.isContentEditable || role === 'combobox' ? element.innerText.trim() : ''
-
-    const push = (kind, actionLabel, extra) => {
-      if (actions.length >= limit) {
-        truncated++
-        return
-      }
-      const operation = kind === 'click' ? 'CLICK' : kind === 'fill' ? 'TYPE_TEXT' : kind === 'upload' ? 'UPLOAD' : 'SELECT'
-      let entry = index.get(ref)
-      if (!entry) {
-        entry = Object.assign({ ref: ref, role: role, label: label, context: context || undefined, operations: [], value: value }, state)
-        index.set(ref, entry)
-        elements.push(entry)
-      }
-      if (!entry.operations.includes(operation)) entry.operations.push(operation)
-      actions.push(Object.assign({ ref: ref, kind: kind, label: actionLabel }, extra))
-    }
+    const push = (kind, actionLabel, action) => add(element, role, kind, actionLabel, { state: state, value: value, action: action })
 
     if (element.type === 'file') {
       push('upload', label, { value: '' })
@@ -235,6 +291,18 @@ const SOURCE = String.raw`(limit) => {
       push(editable ? 'fill' : 'click', label, { value: value })
       if (editable) push('click', 'Open ' + label, { value: value })
     }
+  }
+
+  // A region the page made clickable with a cursor but gave no role: a card, a
+  // list row, an icon or a custom trigger. Anything holding a real control is
+  // left out, because that control is listed on its own.
+  for (const element of pointers) {
+    if (!actionable(element) || element.matches(':disabled') || element.closest('[aria-disabled="true"]')) continue
+    if (element.querySelector(CONTROL)) continue
+    if (!pointOf(element)) continue
+    const label = (nameOf(element, new Set()) || element.getAttribute('title') || '').replace(/\s+/g, ' ').trim()
+    if (!label || label.length > 160) continue
+    add(element, 'clickable', 'click', label, { action: { value: '' } })
   }
 
 
@@ -311,7 +379,11 @@ export function nodeExpression(target: Target): string {
   })()`
 }
 
-/** Resolves a target into a clickable point, scrolling it into view first. */
+/**
+ * Resolves a target into a clickable point. An element that is already fully on
+ * screen is left where it is, so acting on the page does not move it under the
+ * user; anything else is centered before the point is taken.
+ */
 export function resolveExpression(target: Target): string {
   return `(async () => {
     ${locate(target)}
@@ -319,28 +391,104 @@ export function resolveExpression(target: Target): string {
     ${OFFSET}
     ${POINT}
     ${CLICKABLE}
+    ${FRAME}
+    ${ONSCREEN}
     if (!clickable(element)) return { reason: 'hidden' }
     const rect = element.getBoundingClientRect()
     if (rect.width <= 0 || rect.height <= 0) return { reason: 'hidden' }
-    element.scrollIntoView({ block: 'center', inline: 'center' })
-    let probe = element
-    let doc = probe.ownerDocument
-    while (probe.getRootNode().host) probe = probe.getRootNode().host
-    while (doc.defaultView && doc.defaultView.frameElement) {
-      probe = doc.defaultView.frameElement
-      doc = probe.ownerDocument
+    // 'instant' keeps a page that scrolls smoothly from moving the point after
+    // this expression returns, before the event is dispatched.
+    const center = () => element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' })
+    const hit = () => {
+      const point = pointOf(element)
+      if (!point) return null
+      const { probe, doc } = frameOf(element)
+      const top = doc.elementFromPoint(point.x, point.y)
+      return top && (probe === top || probe.contains(top)) ? point : null
     }
-    // A banner or a dialog can land on top while the page is still settling, so
-    // look again over a few frames before calling the point covered.
-    let point = null
-    for (let attempt = 0; attempt < 4; attempt++) {
-      if (attempt) await new Promise((resolve) => requestAnimationFrame(resolve))
-      point = pointOf(element)
-      if (!point) return { reason: 'outside' }
-      const hit = doc.elementFromPoint(point.x, point.y)
-      if (hit && (probe === hit || probe.contains(hit))) return point
+    if (!onScreen(element)) center()
+    let point = hit()
+    // A banner, a dialog, or a page that is still settling can cover an element
+    // that is already on screen. Centering once moves it out from under a fixed
+    // header; the frames let a transient overlay finish animating.
+    if (!point) {
+      center()
+      for (let attempt = 0; attempt < 3 && !point; attempt++) {
+        await new Promise((resolve) => requestAnimationFrame(resolve))
+        point = hit()
+      }
     }
-    return { reason: 'covered' }
+    if (!point) return { reason: pointOf(element) ? 'covered' : 'outside' }
+    return point
+  })()`
+}
+
+/**
+ * Rejects a field that would swallow the text: disabled, read only, not a text
+ * control, a segmented date input, or a value longer than the field allows.
+ * This cannot promise a controlled component keeps what it was given; the value
+ * is read back after typing for that.
+ */
+export function textCheckExpression(target: Target, text: string): string {
+  return `(() => {
+    ${locate(target)}
+    if (element.matches(':disabled') || element.closest('[aria-disabled="true"],[inert]')) return { reason: 'disabled' }
+    if (element.readOnly || element.getAttribute('aria-readonly') === 'true') return { reason: 'readonly' }
+    const field = element.tagName === 'INPUT' || element.tagName === 'TEXTAREA'
+    if (!field && !element.isContentEditable) return { reason: 'not-text' }
+    if (element.tagName === 'INPUT') {
+      const type = String(element.type || 'text').toLowerCase()
+      if (['button', 'checkbox', 'color', 'file', 'hidden', 'image', 'radio', 'range', 'reset', 'submit'].includes(type)) return { reason: 'not-text' }
+      // insertText cannot fill the segmented date and time controls.
+      if (['date', 'datetime-local', 'month', 'time', 'week'].includes(type)) return { reason: 'structured' }
+      const max = element.maxLength
+      if (max >= 0 && ${JSON.stringify(text)}.length > max) return { reason: 'too-long', max: max }
+    }
+    return { ok: true }
+  })()`
+}
+
+/** Reads the live value of a field, so a value the page reverted shows up. */
+export function readValueExpression(target: Target): string {
+  return `(() => {
+    ${locate(target)}
+    const field = element.tagName === 'INPUT' || element.tagName === 'TEXTAREA' || element.tagName === 'SELECT'
+    const value = field ? String(element.value ?? '') : String(element.innerText ?? '')
+    return { value: value, secret: element.type === 'password' }
+  })()`
+}
+
+/** Lists the files a file input holds, so an attach that did not land shows up. */
+export function filesExpression(target: Target): string {
+  return `(() => {
+    ${locate(target)}
+    if (element.tagName !== 'INPUT' || element.type !== 'file') return { reason: 'not-file' }
+    return { names: Array.from(element.files || [], (file) => file.name) }
+  })()`
+}
+
+/**
+ * Describes what a viewport point lands on, so a coordinate click can be read
+ * before or after the press. Walks up to the nearest named ancestor: a label
+ * inside a button describes the button better than the span does.
+ */
+export function hitExpression(x: number, y: number): string {
+  return `(() => {
+    let element = document.elementFromPoint(${x}, ${y})
+    if (!element) return null
+    const nameOf = (node) => (node.getAttribute('aria-label') || node.innerText || String(node.value == null ? '' : node.value) || node.getAttribute('title') || '').replace(/\\s+/g, ' ').trim()
+    let label = ''
+    for (let node = element; node && node !== document.body; node = node.parentElement) {
+      label = nameOf(node).slice(0, 80)
+      if (label) {
+        element = node
+        break
+      }
+    }
+    const tag = element.tagName.toLowerCase()
+    if (tag === 'html' || tag === 'body') return null
+    const role = element.getAttribute('role') || tag
+    return role + (label ? ' ' + JSON.stringify(label) : '')
   })()`
 }
 

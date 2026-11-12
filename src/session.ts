@@ -3,16 +3,21 @@ import type { Target } from './page.ts'
 import type { Snapshot, SnapshotAction } from './snapshot.ts'
 
 import { writeFile } from 'node:fs/promises'
+import { basename } from 'node:path'
 
 import { browserInfo, CDP, listTargets } from './cdp.ts'
 import { ChromeUseError, fail } from './errors.ts'
 import {
+  filesExpression,
+  hitExpression,
   nodeExpression,
   parseTarget,
+  readValueExpression,
   resolveExpression,
   selectExpression,
   settleExpression,
   snapshotExpression,
+  textCheckExpression,
 } from './page.ts'
 import { readState, writeState } from './state.ts'
 import { delay } from './time.ts'
@@ -33,6 +38,16 @@ export interface ScreenshotOptions {
 export interface IdleOptions {
   /** Cap in seconds; the wait resolves false when it expires. */
   maxTime?: number
+}
+
+export interface WaitOptions {
+  /** Cap in seconds; the wait throws TIMEOUT when it expires. */
+  maxTime?: number
+}
+
+export interface PointOptions {
+  /** Describe what is under the point without pressing it. */
+  dryRun?: boolean
 }
 
 export interface TabInfo {
@@ -64,6 +79,9 @@ function isTopFrame(params: Record<string, unknown>): boolean {
   const { frame } = params as { frame?: { parentId?: string | null } }
   return frame?.parentId == null
 }
+
+/** Drops whitespace so a field that reformats what it was given still counts as filled. */
+const squash = (value: string): string => value.replaceAll(/\s+/g, '')
 
 const KEYS: Record<string, KeySpec> = {
   Enter: { code: 'Enter', keyCode: 13, text: '\r' },
@@ -155,6 +173,7 @@ export class Session {
   targetId: string
   private sessionId: string
   private dialogs = 0
+  private dialog?: string
   private detach: () => void
 
   private constructor(cdp: CDP, sessionId: string, port: number, targetId: string) {
@@ -165,7 +184,12 @@ export class Session {
     this.detach = cdp.on((event) => {
       if (event.sessionId !== sessionId) return
       if (event.method === 'Page.javascriptDialogOpening') {
+        // The page asked something. Accept it, like a user who pressed the button
+        // expected, but keep the words: a tool that swallows a "delete everything?"
+        // leaves the caller with no way to notice.
+        const { type, message } = event.params as { type?: string; message?: string }
         this.dialogs++
+        this.dialog = `${type ?? 'dialog'} ${JSON.stringify(message ?? '')}`
         cdp.send('Page.handleJavaScriptDialog', { accept: true }, sessionId).catch(() => {})
       }
     })
@@ -211,8 +235,8 @@ export class Session {
   async snap(options: SnapOptions = {}): Promise<Snapshot> {
     const limit = options.limit ?? 250
     for (let attempt = 0; attempt < 20; attempt++) {
-      const value = await this.eval<Omit<Snapshot, 'dialogs'> | null>(snapshotExpression(limit))
-      if (value) return { ...value, dialogs: this.dialogs }
+      const value = await this.eval<Omit<Snapshot, 'dialogs' | 'dialog'> | null>(snapshotExpression(limit))
+      if (value) return { ...value, dialogs: this.dialogs, ...(this.dialog ? { dialog: this.dialog } : {}) }
       await delay(50)
     }
     fail('STALE', 'The page never settled; take a new snapshot')
@@ -262,20 +286,66 @@ export class Session {
 
   async click(target: string): Promise<Snapshot> {
     const wanted = parseTarget(target)
-    await this.mouse(await this.point(wanted))
+    await this.mouse(await this.pointOf(wanted))
     await this.settle(wanted)
     return this.snap()
   }
 
   async type(target: string, text: string): Promise<Snapshot> {
     const wanted = parseTarget(target)
-    await this.mouse(await this.point(wanted))
+    const name = 'ref' in wanted ? wanted.ref : wanted.selector
+    const check = await this.eval<{ reason?: string; max?: number }>(textCheckExpression(wanted, text))
+    if (check.reason === 'gone') fail('STALE', `Element ${name} is not on the page any more; take a new snapshot`)
+    if (check.reason === 'bad-selector') fail('NOT_INTERACTABLE', `${name} is not a valid CSS selector`)
+    if (check.reason === 'disabled') fail('NOT_INTERACTABLE', `Element ${name} is disabled`)
+    if (check.reason === 'readonly') fail('NOT_INTERACTABLE', `Element ${name} is read only`)
+    if (check.reason === 'not-text')
+      fail('NOT_INTERACTABLE', `Element ${name} does not take text; use click, upload or select`)
+    if (check.reason === 'structured')
+      fail('NOT_INTERACTABLE', `Element ${name} is a segmented date field; set its value with eval instead of typing`)
+    if (check.reason === 'too-long') fail('NOT_INTERACTABLE', `Element ${name} accepts at most ${check.max} characters`)
+    await this.mouse(await this.pointOf(wanted))
     // Select what is already there first, so typing replaces instead of appending.
+    // An empty text clears the field, which is the only way to say "no value".
     const selectAll = process.platform === 'darwin' ? 'Meta+a' : 'Control+a'
     await this.dispatchChord(parseChord(selectAll))
-    await this.cdp.send('Input.insertText', { text }, this.sessionId)
+    if (text) await this.cdp.send('Input.insertText', { text }, this.sessionId)
+    else await this.dispatchChord(parseChord('Backspace'))
+    await this.settle(wanted)
+    // Text a controlled input drops is a failed fill, not a filled field.
+    const read = await this.eval<{ value?: string; secret?: boolean }>(readValueExpression(wanted))
+    if (read.value !== undefined && squash(read.value) !== squash(text)) {
+      const shown = read.secret ? '•'.repeat(read.value.length) : read.value.slice(0, 60)
+      fail('INPUT_MISMATCH', `Element ${name} shows ${JSON.stringify(shown)} after typing; the page changed the value`)
+    }
+    return this.snap()
+  }
+
+  /** Moves the pointer over a target and leaves it there, for menus that open on hover. */
+  async hover(target: string): Promise<Snapshot> {
+    const wanted = parseTarget(target)
+    await this.mouse(await this.pointOf(wanted), true)
     await this.settle(wanted)
     return this.snap()
+  }
+
+  /**
+   * Clicks a point in the viewport, for what the element table cannot see: a
+   * canvas, a drawing, an unnamed SVG. The snapshot says what the point landed
+   * on, and a dry run reports it without pressing anything.
+   */
+  async point(x: number, y: number, options: PointOptions = {}): Promise<Snapshot> {
+    const viewport = await this.eval<{ w: number; h: number }>('({ w: innerWidth, h: innerHeight })')
+    if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x >= viewport.w || y >= viewport.h)
+      fail(
+        'NOT_INTERACTABLE',
+        `Point ${x},${y} is outside the ${viewport.w} by ${viewport.h} viewport; take a new screenshot`,
+      )
+    const hit = await this.eval<string | null>(hitExpression(x, y))
+    if (!hit) fail('NOT_INTERACTABLE', `Nothing is at ${x},${y}; take a new screenshot`)
+    if (!options.dryRun) await this.mouse({ x, y })
+    const snap = await this.snap()
+    return { ...snap, hit }
   }
 
   async select(target: string, value: string): Promise<Snapshot> {
@@ -287,6 +357,13 @@ export class Session {
     if (result.reason === 'no-option')
       fail('NOT_INTERACTABLE', `Element ${target} has no option with value ${JSON.stringify(value)}`)
     await this.settle(wanted)
+    // A controlled select can put the old option back after the events fired.
+    const read = await this.eval<{ value?: string }>(readValueExpression(wanted))
+    if (read.value !== undefined && read.value !== value)
+      fail(
+        'INPUT_MISMATCH',
+        `Element ${target} shows ${JSON.stringify(read.value.slice(0, 60))} after selecting; the page did not keep it`,
+      )
     return this.snap()
   }
 
@@ -317,6 +394,15 @@ export class Session {
       await this.cdp.send('Runtime.releaseObjectGroup', { objectGroup: 'chrome-use' }, this.sessionId).catch(() => {})
     }
     await this.settle(wanted)
+    const attached = await this.eval<{ names?: string[]; reason?: string }>(filesExpression(wanted))
+    if (attached.reason === 'not-file') fail('NOT_INTERACTABLE', `Element ${target} is not a file input`)
+    const expected = files.map((file) => basename(file))
+    const actual = attached.names ?? []
+    if (actual.length !== expected.length || expected.some((name, index) => name !== actual[index]))
+      fail(
+        'INPUT_MISMATCH',
+        `Element ${target} holds ${JSON.stringify(actual)} after the upload; the page did not keep the file(s)`,
+      )
     return this.snap()
   }
 
@@ -333,6 +419,49 @@ export class Session {
     const maxTime = options.maxTime ?? 3
     const timeout = new Promise<boolean>((done) => setTimeout(() => done(false), maxTime * 1000))
     return Promise.race([this.waitForNetworkIdle(), timeout])
+  }
+
+  /** Polls the page until `expression` is truthy. */
+  async waitFor<T = unknown>(expression: string, options: WaitOptions = {}): Promise<T> {
+    return this.poll<T>(expression, (value) => value != null && value !== false && value !== '', options)
+  }
+
+  /** Polls until location.href equals `wanted`, or matches the expression. */
+  async waitForURL(wanted: string | RegExp, options: WaitOptions = {}): Promise<void> {
+    const pattern = typeof wanted === 'string' ? undefined : new RegExp(wanted.source, wanted.flags)
+    await this.poll(
+      'location.href',
+      (value) => typeof value === 'string' && (pattern ? pattern.test(value) : value === wanted),
+      options,
+    )
+  }
+
+  /** Polls until the page text contains `text`. */
+  async waitForText(text: string, options: WaitOptions & { exact?: boolean } = {}): Promise<void> {
+    const wanted = text.replaceAll(/\s+/g, ' ').trim().toLowerCase()
+    await this.poll(
+      '(document.body ? document.body.innerText : "").replace(/\\s+/g, " ").trim()',
+      (value) => {
+        const page = typeof value === 'string' ? value.toLowerCase() : ''
+        return options.exact ? page === wanted : page.includes(wanted)
+      },
+      options,
+    )
+  }
+
+  private async poll<T = unknown>(
+    expression: string,
+    done: (value: unknown) => boolean,
+    options: WaitOptions = {},
+  ): Promise<T> {
+    const maxTime = options.maxTime ?? 10
+    const deadline = Date.now() + maxTime * 1000
+    while (true) {
+      const value = await this.eval<T>(expression).catch(() => undefined)
+      if (done(value)) return value as T
+      if (Date.now() >= deadline) fail('TIMEOUT', `The page did not reach the expected state within ${maxTime}s`)
+      await delay(200)
+    }
   }
 
   async screenshot(file?: string, options: ScreenshotOptions = {}): Promise<Buffer> {
@@ -462,7 +591,7 @@ export class Session {
     if (state) writeState({ ...state, tab: this.targetId })
   }
 
-  private async point(target: Target): Promise<Point> {
+  private async pointOf(target: Target): Promise<Point> {
     const hit = await this.eval<TargetHit>(resolveExpression(target))
     const name = 'ref' in target ? target.ref : target.selector
     if (hit.reason === 'gone' || hit.reason === 'hidden') {
@@ -477,8 +606,9 @@ export class Session {
     return { x, y }
   }
 
-  private async mouse(point: Point): Promise<void> {
+  private async mouse(point: Point, hover = false): Promise<void> {
     await this.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: point.x, y: point.y }, this.sessionId)
+    if (hover) return
     for (const type of ['mousePressed', 'mouseReleased']) {
       await this.cdp.send(
         'Input.dispatchMouseEvent',

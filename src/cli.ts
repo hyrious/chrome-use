@@ -28,13 +28,15 @@ const USAGE = `chrome-use: drive the user's own headed Chrome over CDP.
   chrome-use snap [--tab id] [--json] [--limit 250]
   chrome-use open <url> [--tab id] [--json]
   chrome-use click <ref|selector> [--json]
+  chrome-use hover <ref|selector> [--json]        # for menus that open on hover
+  chrome-use point <x> <y> [--dry-run] [--json]   # a viewport point, for a canvas or an unnamed control
   chrome-use type <ref|selector> <text> [--json]
   chrome-use select <ref|selector> <value> [--json]
   chrome-use upload <ref|selector> <file>...
   chrome-use press <key>              # Enter, Tab, or a chord like Control+a
   chrome-use eval '<js>'                 # expression in the page
   chrome-use js [code] [-f|--file path]  # script in node, with cu bound to the session
-  chrome-use screenshot [file] [--full]
+  chrome-use screenshot [file] [--full] [--json]
   chrome-use cdp <method> ['<json params>']
   chrome-use decide --goal <text> [--dry-run] [--json]
   chrome-use agent --goal <text> [--max-steps 20] [--fill 'Field=value']... [--upload 'Field=/path']...
@@ -43,9 +45,10 @@ const USAGE = `chrome-use: drive the user's own headed Chrome over CDP.
                       [--dry-run] [--json]
   chrome-use skill
 
-Click, type, select and upload take a ref from snap, or a CSS selector for what
-snap leaves out: a file input a styled button opens, a div that only carries a
-click handler, or a form control on a page too long to snapshot in one view.
+Click, hover, type, select and upload take a ref from snap, or a CSS selector for
+what snap leaves out: a file input a styled button opens, a div that only carries
+a click handler, or a form control on a page too long to snapshot in one view.
+type and select read the value back, so a field that reverts fails loudly.
 
 Every command accepts --tab <id|prefix|index> and the model commands read
 CHROME_USE_JEV_BASE_URL / CHROME_USE_JEV_API_KEY / CHROME_USE_JEV_MODEL and
@@ -101,6 +104,12 @@ function modelOptions(args: Args, kind: 'jev' | 'text', required = true): ModelC
 function positional(args: Args, index: number, message: string): string {
   const value = args.positionals[index]
   if (value === undefined) fail('NOT_INTERACTABLE', message)
+  return value
+}
+
+function numberOf(args: Args, index: number, message: string): number {
+  const value = Number(positional(args, index, message))
+  if (!Number.isFinite(value)) fail('NOT_INTERACTABLE', `${message}; got ${JSON.stringify(args.positionals[index])}`)
   return value
 }
 
@@ -176,6 +185,7 @@ const SNAPSHOT_ACTIONS: Record<string, (session: Session, args: Args) => Promise
   snap: (session, args) => session.snap({ limit: numberFlag(args, ['--limit'], 250) }),
   open: (session, args) => session.open(positional(args, 0, 'open needs a url')),
   click: (session, args) => session.click(refOf(args)),
+  hover: (session, args) => session.hover(refOf(args)),
   type: (session, args) => session.type(refOf(args), positional(args, 1, 'type needs a ref and a text')),
   select: (session, args) => session.select(refOf(args), positional(args, 1, 'select needs a ref and a value')),
   upload: (session, args) => session.upload(refOf(args), filesFrom(args)),
@@ -222,8 +232,39 @@ async function scriptSource(args: Args): Promise<string> {
 
 async function screenshotCommand(args: Args): Promise<void> {
   const file = args.positionals[0] ?? 'chrome-use.png'
-  await withSession(args, (session) => session.screenshot(file, { full: booleanFlag(args, '--full') }))
+  const shot = await withSession(args, async (session) => {
+    const buffer = await session.screenshot(file, { full: booleanFlag(args, '--full') })
+    const size = pngSize(buffer)
+    const viewport = await session.eval<{ w: number; h: number }>('({ w: innerWidth, h: innerHeight })')
+    return {
+      file,
+      bytes: buffer.length,
+      width: size?.width,
+      height: size?.height,
+      viewport: { width: viewport.w, height: viewport.h },
+    }
+  })
+  if (booleanFlag(args, '--json')) {
+    const scale = shot.width && shot.viewport.width ? shot.width / shot.viewport.width : 1
+    console.log(JSON.stringify({ ...shot, scale }, null, 2))
+    return
+  }
   console.log(file)
+}
+
+/** A screenshot is in device pixels; a coordinate is in the CSS pixels of the page. */
+function pngSize(buffer: Buffer): { width: number; height: number } | undefined {
+  if (buffer.length < 24 || buffer.toString('latin1', 1, 4) !== 'PNG') return undefined
+  return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) }
+}
+
+async function pointCommand(args: Args): Promise<void> {
+  const x = numberOf(args, 0, 'point needs an x coordinate')
+  const y = numberOf(args, 1, 'point needs a y coordinate')
+  const dryRun = booleanFlag(args, '--dry-run')
+  const snap = await withSession(args, (session) => session.point(x, y, { dryRun }))
+  console.error(`${dryRun ? 'dry run, nothing pressed' : 'pressed'}; the point is over ${snap.hit}`)
+  printSnapshot(snap, booleanFlag(args, '--json'))
 }
 
 async function cdpCommand(args: Args): Promise<void> {
@@ -327,6 +368,7 @@ const COMMANDS: Record<string, Command> = {
   close: closeCommand,
   ...Object.fromEntries(Object.keys(SNAPSHOT_ACTIONS).map((name) => [name, snapshotCommand(name)])),
   press: pressCommand,
+  point: pointCommand,
   eval: evalCommand,
   js: jsCommand,
   screenshot: screenshotCommand,

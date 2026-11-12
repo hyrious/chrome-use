@@ -31,9 +31,11 @@ export type {
   ConnectOptions,
   IdleOptions,
   Point,
+  PointOptions,
   ScreenshotOptions,
   SnapOptions,
   TabInfo,
+  WaitOptions,
 } from './session.ts'
 export type { ScrollState, Snapshot, SnapshotAction, SnapshotElement } from './snapshot.ts'
 export type { AppState } from './state.ts'

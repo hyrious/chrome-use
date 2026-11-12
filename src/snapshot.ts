@@ -38,4 +38,8 @@ export interface Snapshot {
   hiddenFrames: number
   truncated: number
   dialogs: number
+  /** What a coordinate click landed on, when that is how the snapshot was taken. */
+  hit?: string
+  /** The last native dialog this session accepted, as `type "message"`. */
+  dialog?: string
 }

@@ -45,17 +45,24 @@ Ask the user for the proxy address instead of guessing when 7890 is not obviousl
 
 ## Three ways to work, cheapest first
 
-**One command.** `snap`, then `click`, `type`, `select`, `upload`, `open`. No model is involved, so this is the cheapest and the most predictable. It is enough whenever you already know what to press:
+**One command.** `snap`, then `click`, `hover`, `type`, `select`, `upload`, `open`. No model is involved, so this is the cheapest and the most predictable. It is enough whenever you already know what to press:
 
 ```bash
 chrome-use snap                        # text plus an element table
 chrome-use click e12-9fk
+chrome-use hover e9-b2m
 chrome-use type e15-9fk "lisbon"
 chrome-use press Enter
 chrome-use upload e12-9fk ./receipt.png
 ```
 
-`snap` prints `ref role "label" operations`. A ref looks like `e12-9fk`: the element number plus a token for the current document. Treat it as opaque, copy it exactly, and act only on refs from the latest snapshot. Never invent a selector and never click by coordinates. `click`, `type`, `select`, `upload`, `open`, and `press` all return the new snapshot.
+`snap` prints `ref role "label" operations`. A ref looks like `e12-9fk`: the element number plus a token for the current document. Treat it as opaque, copy it exactly, and act only on refs from the latest snapshot. Never invent a selector, and treat a coordinate as a last resort. `click`, `hover`, `point`, `type`, `select`, `upload`, `open`, and `press` all return the new snapshot.
+
+A click leaves the page where it is when the element is already fully visible, and centers it otherwise. An element under a fixed banner or footer is centered once before the press; if it is still covered, the click fails with `NOT_INTERACTABLE` instead of pressing whatever is on top.
+
+`hover` moves the pointer and leaves it there, which is what opens a menu or a tooltip. Hover the trigger, take the returned snapshot, then click the ref that appeared.
+
+A `clickable` entry is a region the page only marked with a pointer cursor: a card, a list row, an icon, a custom dropdown trigger. It is worth a click, but nothing promises a handler, so read the snapshot that comes back before assuming the step worked.
 
 When the table leaves the node out, pass a CSS selector instead of a ref. That covers what the table cannot see: the file input behind a styled upload box, a `div` that only carries a click handler, a control on a form too long to snapshot in one view.
 
@@ -64,6 +71,16 @@ chrome-use upload 'input[type=file]' ./receipt.png
 chrome-use click 'button.add'
 chrome-use press Control+a             # also Meta+z, Shift+Tab, Escape
 ```
+
+**Coordinates, when nothing else reaches it.** A canvas, a drawing, or an unnamed SVG has no ref and no selector. Screenshot the viewport, read `scale`, convert image pixels back to CSS pixels with `css = image / scale`, and press a point. Dry run first: it says what the point is over and presses nothing.
+
+```bash
+chrome-use screenshot ./page.png --json   # file, width, height, viewport, scale
+chrome-use point 240 180 --dry-run        # "nothing pressed; the point is over canvas"
+chrome-use point 240 180
+```
+
+A coordinate is CSS pixels of the current viewport, so it means nothing after a scroll, a resize, or a navigation: take a new screenshot and read it again. It is for what the page draws rather than builds, never a way around an obscured or missing ref.
 
 **One script.** When the flow needs logic, a loop, several coordinated steps, or a comparison across the page, write it once with `chrome-use js`:
 
@@ -77,6 +94,8 @@ JS
 ```
 
 The script body may await and its return value is printed. It also gets `sleep` and `console`. Use `--file path` for something longer, or import the package in a normal `.mjs` when the script has to outlive one run, and wait for a page with `cu.waitForIdle()` rather than sleeping.
+
+For a page that changes on its own, poll with `cu.waitForText('32 results')`, `cu.waitForURL(/\/done$/)`, or `cu.waitFor('document.querySelector("#row")')`. Each takes `{ maxTime }` in seconds and throws `TIMEOUT` instead of returning quietly.
 
 **The loop, only for fixed sequences.** When the next step depends on what the page shows and you do not want to look yourself, let `agent` pick from the offered operations:
 
@@ -114,13 +133,17 @@ It returns `verified: false` always, so verify the result yourself (URL, page te
 ## Rules that save you time
 
 - Act only on refs from the latest snapshot.
+- `type` and `select` read the value back. `INPUT_MISMATCH` means the page kept something else: a controlled field reverted it, a formatter rewrote it, or the field is not what the table said. Read the message, look at the page, and decide — do not retype the same text. Whitespace differences are tolerated.
+- `type` refuses a field that cannot take text before it presses anything: read only, disabled, a segmented date/time input, or a value longer than the field allows. Set a date field through `chrome-use eval` instead.
+- `type` with an empty text clears the field. That is the way to say "no value".
+- `upload` reads the file input back. `INPUT_MISMATCH` means the page dropped or rewrote the selection: the wrong input, a component that keeps only one file, an `onchange` that resets it. Look at the input before retrying.
 - Do not sleep to wait for a page. `waitForIdle()` then `snap()` again, or read the new snapshot an action already returned.
-- A click scrolls the element into view and hit tests it. If it throws `NOT_INTERACTABLE`, something really covers it: close the overlay or scroll, then retry.
+- A click scrolls the element into view only when it is not already fully on screen, then hit tests it. If it throws `NOT_INTERACTABLE`, something really covers it: close the overlay or scroll, then retry.
 - `STALE` means the element is gone. Take a new snapshot and find the element again by label, not by remembering the ref.
 - Refs carry a document token, so one from before a navigation is rejected with `STALE` instead of silently hitting a different element. Take a new `snap`.
 - Human walls belong to the user: login, captcha, 2FA, payment, an identity check. Stop there. Anything short of a wall — an awkward widget, a missing label, an overlay in the way — belongs to you; a selector or a script can usually reach it.
 - Uploading a file publishes it to the site. Only use a path the user named, or one unpacked from a path the user named, and never attach something you found by guessing.
-- Native `alert` dialogs are dismissed automatically and counted in `snap.dialogs`.
+- Native dialogs are accepted automatically, because you pressed the button that asked. `snap.dialogs` counts them and `snap.dialog` carries the last one as `type "message"`. A `confirm` is a question you have already answered yes to: read it before continuing, and say so in the closing report when it mattered.
 - Elements inside open shadow roots and same-origin iframes appear in the table and can be clicked. Cross-origin frames cannot; ask the user when a payment or captcha widget lives there.
 - The element table only covers what the viewport shows. If the control you need is not listed, `SCROLL_DOWN` before concluding anything.
 - `BACK` returns to the previous page. When a link opens a new tab, the current page does not change. The next request offers `SWITCH_1` and friends; switch, then continue there. `chrome-use status` lists tabs, `--tab` picks one by id, prefix, or index, and `chrome-use close` shuts the current one when you are done with it.
@@ -143,11 +166,13 @@ It prints the exact JSON sent to the decision endpoint: the page text, the eleme
 | `NOT_RUNNING` | nothing on the port | `chrome-use start` |
 | `NETWORK` | the page never loaded | restart Chrome with `-x <proxy>`, or ask the user for one |
 | `STALE` | ref is gone | `snap`, find the element again |
-| `NOT_INTERACTABLE` | covered, disabled, or wrong kind | close the overlay, pick another target |
+| `NOT_INTERACTABLE` | covered, disabled, read only, wrong kind, over maxlength, or outside the viewport | close the overlay, pick another target, shorten the text, take a new screenshot |
+| `INPUT_MISMATCH` | the value did not stay | read the message, take a snapshot, adjust; do not retype |
 | `NEEDS_TEXT` | a fill has no value | pass `--fill 'Field=value'` |
 | `MODEL_ERROR` | the decision endpoint refused or timed out | check the failing model’s `--jev-*` or `--text-*` configuration |
 | `INVALID_DECISION` | the answer was outside the offered choices | rerun; if it repeats, `--dry-run` and inspect |
 | `CHROME_NOT_FOUND` | no Chrome binary | `--chrome <path>` or `CHROME_PATH` |
+| `TIMEOUT` | a `waitFor*` helper ran out of time | take a snapshot and see what the page is actually showing |
 | `SCRIPT_ERROR` | `chrome-use js` could not parse the code | fix the script, or pass `--file` |
 
 ## Direct CDP

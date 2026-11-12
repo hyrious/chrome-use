@@ -22,5 +22,6 @@ export function printSnapshot(snap: Snapshot, asJson: boolean): void {
   if (snap.hiddenFrames)
     console.log(`\n${snap.hiddenFrames} frame(s) from another origin not readable; the loop cannot act inside them`)
   if (snap.truncated) console.log(`\n${snap.truncated} more element(s) not listed; scroll or narrow the page`)
-  if (snap.dialogs) console.log(`\ndismissed ${snap.dialogs} dialog(s)`)
+  if (snap.dialogs)
+    console.log(`\naccepted ${snap.dialogs} dialog(s)${snap.dialog ? `, the last one: ${snap.dialog}` : ''}`)
 }
